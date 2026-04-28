@@ -12,20 +12,62 @@ import {
   BulkProxyRequest,
   BulkDeleteRequest,
   ProxyTestResult,
+  InfrastructureResponse,
 } from "./types"
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8001"
+function stripTrailingSlash(url: string): string {
+  return url.replace(/\/$/, "")
+}
 
 class ApiClient {
-  private baseUrl: string
   private token: string | null = null
+  /** If set, always use this base (e.g. tests). */
+  private readonly baseUrlOverride: string | null
 
-  constructor(baseUrl: string = API_BASE_URL) {
-    this.baseUrl = baseUrl
-    // Load token from localStorage if available
+  constructor(baseUrl?: string) {
+    this.baseUrlOverride =
+      baseUrl !== undefined ? stripTrailingSlash(baseUrl) : null
     if (typeof window !== "undefined") {
       this.token = localStorage.getItem("auth_token")
     }
+  }
+
+  /**
+   * Dev (`next dev`): browser calls the Go API directly on :8001 (avoids Next proxy noise; needs CORS on the API).
+   * Production build: same-origin `/api/v1/...` → Next rewrites to the core (Docker / `next start`).
+   * Override anytime with NEXT_PUBLIC_API_URL.
+   */
+  private getBaseUrl(): string {
+    if (this.baseUrlOverride !== null) {
+      return this.baseUrlOverride
+    }
+    const env = process.env.NEXT_PUBLIC_API_URL?.trim()
+    if (env) {
+      return stripTrailingSlash(env)
+    }
+    if (typeof window !== "undefined") {
+      return process.env.NODE_ENV === "development"
+        ? "http://127.0.0.1:8001"
+        : ""
+    }
+    return "http://127.0.0.1:8001"
+  }
+
+  /** WebSockets are not proxied by Next dev; talk to the API port directly when using same-origin HTTP. */
+  private getWebSocketBase(): string {
+    const base = this.getBaseUrl()
+    if (base !== "") {
+      if (base.startsWith("https")) {
+        return "wss" + base.slice("https".length)
+      }
+      return base.replace(/^http/, "ws")
+    }
+    if (typeof window !== "undefined") {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:"
+      const { hostname } = window.location
+      return `${proto}//${hostname}:8001`
+    }
+    return "ws://127.0.0.1:8001"
   }
 
   setToken(token: string) {
@@ -52,12 +94,35 @@ class ApiClient {
     return headers
   }
 
+  private networkErrorMessage(): string {
+    const base = this.getBaseUrl()
+    const hint = base
+      ? ` (${base})`
+      : " (via this app’s /api/v1 proxy to port 8001)"
+    return `Cannot reach the API${hint}. From dashboard folder run npm run dev (starts Docker + API), or npm run dev:ui after starting the core on port 8001.`
+  }
+
+  private async fetchWithNetworkGuard(
+    url: string,
+    init?: RequestInit
+  ): Promise<Response> {
+    try {
+      return await fetch(url, init)
+    } catch (e) {
+      if (e instanceof TypeError) {
+        throw new Error(this.networkErrorMessage())
+      }
+      throw e
+    }
+  }
+
   private async request<T>(
     endpoint: string,
     options: RequestInit = {}
   ): Promise<T> {
-    const url = `${this.baseUrl}${endpoint}`
-    const response = await fetch(url, {
+    const base = this.getBaseUrl()
+    const url = `${base}${endpoint}`
+    const response = await this.fetchWithNetworkGuard(url, {
       ...options,
       headers: {
         ...this.getHeaders(),
@@ -72,7 +137,6 @@ class ApiClient {
       throw new Error(error.error || error.message || "Request failed")
     }
 
-    // Handle 204 No Content
     if (response.status === 204) {
       return {} as T
     }
@@ -80,7 +144,6 @@ class ApiClient {
     return response.json()
   }
 
-  // Authentication
   async login(username: string, password: string): Promise<AuthResponse> {
     const response = await this.request<AuthResponse>("/api/v1/auth/login", {
       method: "POST",
@@ -90,7 +153,6 @@ class ApiClient {
     return response
   }
 
-  // Dashboard
   async getDashboardStats(): Promise<DashboardStats> {
     return this.request<DashboardStats>("/api/v1/dashboard/stats")
   }
@@ -107,13 +169,14 @@ class ApiClient {
     )
   }
 
-  // Proxies
   async getProxies(params?: {
     page?: number
     limit?: number
     search?: string
     status?: string
     protocol?: string
+    category?: string
+    country?: string
     sort?: string
     order?: "asc" | "desc"
   }): Promise<ProxiesResponse> {
@@ -178,16 +241,18 @@ class ApiClient {
     })
   }
 
-  async exportProxies(format: "txt" | "json" | "csv" = "txt", status?: string): Promise<Blob> {
+  async exportProxies(
+    format: "txt" | "json" | "csv" = "txt",
+    status?: string
+  ): Promise<Blob> {
     const params = new URLSearchParams({ format })
     if (status) params.append("status", status)
 
-    const response = await fetch(
-      `${this.baseUrl}/api/v1/proxies/export?${params.toString()}`,
-      {
-        headers: this.getHeaders(),
-      }
-    )
+    const base = this.getBaseUrl()
+    const url = `${base}/api/v1/proxies/export?${params.toString()}`
+    const response = await this.fetchWithNetworkGuard(url, {
+      headers: this.getHeaders(),
+    })
 
     if (!response.ok) {
       throw new Error("Export failed")
@@ -202,7 +267,17 @@ class ApiClient {
     })
   }
 
-  // Logs
+  async detectCountries(force: boolean = false): Promise<{
+    scanned: number
+    updated: number
+    force: boolean
+  }> {
+    return this.request(
+      `/api/v1/proxies/detect-countries${force ? "?force=true" : ""}`,
+      { method: "POST" }
+    )
+  }
+
   async getLogs(params?: {
     page?: number
     limit?: number
@@ -224,12 +299,15 @@ class ApiClient {
     return this.request<LogsResponse>(`/api/v1/logs${query ? `?${query}` : ""}`)
   }
 
-  async exportLogs(format: "txt" | "json" = "txt", params?: {
-    level?: string
-    source?: string
-    start_time?: string
-    end_time?: string
-  }): Promise<Blob> {
+  async exportLogs(
+    format: "txt" | "json" = "txt",
+    params?: {
+      level?: string
+      source?: string
+      start_time?: string
+      end_time?: string
+    }
+  ): Promise<Blob> {
     const searchParams = new URLSearchParams({ format })
     if (params) {
       Object.entries(params).forEach(([key, value]) => {
@@ -239,12 +317,11 @@ class ApiClient {
       })
     }
 
-    const response = await fetch(
-      `${this.baseUrl}/api/v1/logs/export?${searchParams.toString()}`,
-      {
-        headers: this.getHeaders(),
-      }
-    )
+    const base = this.getBaseUrl()
+    const url = `${base}/api/v1/logs/export?${searchParams.toString()}`
+    const response = await this.fetchWithNetworkGuard(url, {
+      headers: this.getHeaders(),
+    })
 
     if (!response.ok) {
       throw new Error("Export failed")
@@ -253,12 +330,14 @@ class ApiClient {
     return response.blob()
   }
 
-  // System Metrics
   async getSystemMetrics(): Promise<SystemMetrics> {
     return this.request<SystemMetrics>("/api/v1/metrics/system")
   }
 
-  // Settings
+  async getInfrastructure(): Promise<InfrastructureResponse> {
+    return this.request<InfrastructureResponse>("/api/v1/infrastructure")
+  }
+
   async getSettings(): Promise<Settings> {
     return this.request<Settings>("/api/v1/settings")
   }
@@ -282,10 +361,13 @@ class ApiClient {
     })
   }
 
-  // WebSocket connections
-  createDashboardWebSocket(onMessage: (data: DashboardStats) => void): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws")
-    const ws = new WebSocket(`${wsUrl}/ws/dashboard${this.token ? `?token=${this.token}` : ""}`)
+  createDashboardWebSocket(
+    onMessage: (data: DashboardStats) => void
+  ): WebSocket {
+    const wsBase = this.getWebSocketBase()
+    const ws = new WebSocket(
+      `${wsBase}/ws/dashboard${this.token ? `?token=${this.token}` : ""}`
+    )
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data)
@@ -302,16 +384,20 @@ class ApiClient {
     levels?: string[],
     source?: string
   ): WebSocket {
-    const wsUrl = this.baseUrl.replace(/^http/, "ws")
-    const ws = new WebSocket(`${wsUrl}/ws/logs${this.token ? `?token=${this.token}` : ""}`)
+    const wsBase = this.getWebSocketBase()
+    const ws = new WebSocket(
+      `${wsBase}/ws/logs${this.token ? `?token=${this.token}` : ""}`
+    )
 
     ws.onopen = () => {
-      if (levels && levels.length > 0 || source) {
-        ws.send(JSON.stringify({
-          action: "filter",
-          levels: levels || [],
-          source: source || ""
-        }))
+      if ((levels && levels.length > 0) || source) {
+        ws.send(
+          JSON.stringify({
+            action: "filter",
+            levels: levels || [],
+            source: source || "",
+          })
+        )
       }
     }
 
@@ -324,8 +410,6 @@ class ApiClient {
   }
 }
 
-// Export singleton instance
 export const api = new ApiClient()
 
-// Export class for custom instances
 export { ApiClient }

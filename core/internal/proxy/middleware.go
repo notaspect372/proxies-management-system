@@ -96,7 +96,7 @@ func (m *AuthMiddleware) unauthorized() *http.Response {
 		ProtoMinor: 1,
 		Header:     make(http.Header),
 	}
-	resp.Header.Set("Proxy-Authenticate", `Basic realm="Rota Proxy"`)
+	resp.Header.Set("Proxy-Authenticate", `Basic realm="Proxy Monitoring System"`)
 	return resp
 }
 

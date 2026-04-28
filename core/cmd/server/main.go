@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -78,6 +79,32 @@ func run() error {
 	proxyRepo := repository.NewProxyRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
 	logRepo := repository.NewLogRepository(db)
+	assignmentRepo := repository.NewAssignmentRepository(db)
+
+	// Per-machine routing defaults — when set, scrapers can use plain
+	// `proxy=localhost:8006` and routing kicks in based on this machine's
+	// configured identity. See ROUTING_DEFAULT_MACHINE / ROUTING_DEFAULT_COUNTRY.
+	if cfg.RoutingDefaultMachine != "" {
+		proxy.SetRoutingDefaults(cfg.RoutingDefaultMachine, cfg.RoutingDefaultCountry)
+		log.Info("routing defaults configured",
+			"machine_id", cfg.RoutingDefaultMachine,
+			"country", cfg.RoutingDefaultCountry,
+		)
+	}
+
+	// Per-country aux listeners — open one extra port per (machine, country)
+	// pair so scrapers that won't send Proxy-Authorization (Chrome under SB
+	// UC mode) can still hit a country-specific port and have routing
+	// engage. See AUX_LISTENERS in config.
+	if len(cfg.AuxListeners) > 0 {
+		specs := make([]proxy.AuxListenerSpec, 0, len(cfg.AuxListeners))
+		for _, l := range cfg.AuxListeners {
+			specs = append(specs, proxy.AuxListenerSpec{Country: l.Country, Port: l.Port})
+		}
+		if err := proxy.StartAuxListeners(cfg.RoutingDefaultMachine, cfg.ProxyPort, specs, log); err != nil {
+			return fmt.Errorf("failed to start aux listeners: %w", err)
+		}
+	}
 
 	// Add database logging hook for proxy logs
 	log.AddHook(func(level, message string, attrs map[string]any) {
@@ -122,6 +149,9 @@ func run() error {
 
 		// Create log entry in database
 		if err := logRepo.Create(dbCtx, level, message, detailsPtr, attrs); err != nil {
+			if isIgnorableMongoWriteError(err) {
+				return
+			}
 			// Don't log errors to avoid infinite loop
 			fmt.Fprintf(os.Stderr, "failed to write log to database: %v\n", err)
 		}
@@ -135,7 +165,7 @@ func run() error {
 	defer logCleanupService.Stop()
 
 	// Create servers
-	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo)
+	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo, assignmentRepo)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy server: %w", err)
 	}
@@ -216,4 +246,15 @@ func run() error {
 
 	log.Info("shutdown completed successfully")
 	return nil
+}
+
+func isIgnorableMongoWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timed out while checking out a connection from connection pool") ||
+		strings.Contains(msg, "client is disconnected") ||
+		strings.Contains(msg, "closed connection pool")
 }

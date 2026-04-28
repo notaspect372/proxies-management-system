@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/repository"
@@ -37,11 +38,17 @@ type RequestRecord struct {
 func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) error {
 	// Insert into proxy_requests hypertable
 	if err := t.insertProxyRequest(ctx, record); err != nil {
+		if shouldIgnoreUsageDBError(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to insert proxy request: %w", err)
 	}
 
 	// Update proxy statistics
 	if err := t.updateProxyStats(ctx, record); err != nil {
+		if shouldIgnoreUsageDBError(err) {
+			return nil
+		}
 		return fmt.Errorf("failed to update proxy stats: %w", err)
 	}
 
@@ -50,6 +57,28 @@ func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) 
 
 // insertProxyRequest inserts a record into the proxy_requests hypertable
 func (t *UsageTracker) insertProxyRequest(ctx context.Context, record RequestRecord) error {
+	if t.repo.GetDB().IsMongo() {
+		var statusCode *int
+		if record.StatusCode > 0 {
+			statusCode = &record.StatusCode
+		}
+		var errorMsg *string
+		if record.ErrorMessage != "" {
+			errorMsg = &record.ErrorMessage
+		}
+		return t.repo.RecordProxyRequest(ctx, map[string]any{
+			"proxy_id":      record.ProxyID,
+			"proxy_address": record.ProxyAddress,
+			"method":        record.Method,
+			"url":           record.RequestedURL,
+			"status_code":   statusCode,
+			"success":       record.Success,
+			"response_time": record.ResponseTime,
+			"error":         errorMsg,
+			"timestamp":     record.Timestamp,
+		})
+	}
+
 	query := `
 		INSERT INTO proxy_requests (
 			proxy_id, proxy_address, method, url, status_code, success, response_time, error, timestamp
@@ -85,6 +114,14 @@ func (t *UsageTracker) insertProxyRequest(ctx context.Context, record RequestRec
 
 // updateProxyStats updates proxy statistics in the proxies table
 func (t *UsageTracker) updateProxyStats(ctx context.Context, record RequestRecord) error {
+	if t.repo.GetDB().IsMongo() {
+		var errorMsg *string
+		if record.ErrorMessage != "" {
+			errorMsg = &record.ErrorMessage
+		}
+		return t.repo.UpdateProxyAfterRequest(ctx, record.ProxyID, record.Success, record.ResponseTime, record.Timestamp, errorMsg)
+	}
+
 	// Use a single query to update all statistics atomically
 	// Note: We calculate avg_response_time correctly by using current requests value before increment
 	query := `
@@ -141,6 +178,10 @@ func (t *UsageTracker) updateProxyStats(ctx context.Context, record RequestRecor
 
 // UpdateProxyStatus updates only the status of a proxy
 func (t *UsageTracker) UpdateProxyStatus(ctx context.Context, proxyID int, status string) error {
+	if t.repo.GetDB().IsMongo() {
+		return t.repo.UpdateProxyStatusOnly(ctx, proxyID, status)
+	}
+
 	query := `
 		UPDATE proxies
 		SET status = $1, updated_at = NOW()
@@ -153,6 +194,10 @@ func (t *UsageTracker) UpdateProxyStatus(ctx context.Context, proxyID int, statu
 
 // RecordHealthCheck records a health check result
 func (t *UsageTracker) RecordHealthCheck(ctx context.Context, proxyID int, success bool, responseTime int, errorMsg string) error {
+	if t.repo.GetDB().IsMongo() {
+		return t.repo.RecordHealthCheckResult(ctx, proxyID, success, time.Now(), errorMsg)
+	}
+
 	now := time.Now()
 
 	status := "active"
@@ -191,6 +236,39 @@ func (t *UsageTracker) RecordHealthCheck(ctx context.Context, proxyID int, succe
 
 // GetRecentRequests retrieves recent requests for a proxy
 func (t *UsageTracker) GetRecentRequests(ctx context.Context, proxyID int, limit int) ([]RequestRecord, error) {
+	if t.repo.GetDB().IsMongo() {
+		docs, err := t.repo.GetRecentRequestsMongo(ctx, proxyID, limit)
+		if err != nil {
+			return nil, err
+		}
+		records := make([]RequestRecord, 0, len(docs))
+		for _, d := range docs {
+			record := RequestRecord{ProxyID: proxyID}
+			if v, ok := d["method"].(string); ok {
+				record.Method = v
+			}
+			if v, ok := d["url"].(string); ok {
+				record.RequestedURL = v
+			}
+			if v, ok := d["response_time"].(int32); ok {
+				record.ResponseTime = int(v)
+			} else if v, ok := d["response_time"].(int); ok {
+				record.ResponseTime = v
+			}
+			if v, ok := d["error"].(string); ok {
+				record.ErrorMessage = v
+			}
+			if v, ok := d["success"].(bool); ok {
+				record.Success = v
+			}
+			if v, ok := d["timestamp"].(time.Time); ok {
+				record.Timestamp = v
+			}
+			records = append(records, record)
+		}
+		return records, nil
+	}
+
 	query := `
 		SELECT
 			proxy_id, method, url, status, response_time,
@@ -230,4 +308,15 @@ func (t *UsageTracker) GetRecentRequests(ctx context.Context, proxyID int, limit
 	}
 
 	return records, nil
+}
+
+func shouldIgnoreUsageDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "closed connection pool") ||
+		strings.Contains(msg, "client is disconnected") ||
+		strings.Contains(msg, "context deadline exceeded") ||
+		strings.Contains(msg, "timed out while checking out a connection from connection pool")
 }

@@ -19,7 +19,9 @@ RUN corepack enable && corepack prepare pnpm@10.19.0 --activate
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Set environment variables for build
+# Set environment variables for build (rewrites /api/v1 → core API inside compose network)
+ARG INTERNAL_API_URL=http://rota-core:8001
+ENV INTERNAL_API_URL=$INTERNAL_API_URL
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 

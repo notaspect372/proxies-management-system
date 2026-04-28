@@ -28,7 +28,7 @@ func (h *DocumentationHandler) ServeDocumentation(w http.ResponseWriter, r *http
 	htmlContent, err := scalar.ApiReferenceHTML(&scalar.Options{
 		SpecURL: swaggerURL,
 		CustomOptions: scalar.CustomOptions{
-			PageTitle: "Rota Proxy API Documentation",
+			PageTitle: "Proxy Monitoring System API",
 		},
 		DarkMode: true,
 	})

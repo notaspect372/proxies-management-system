@@ -46,12 +46,12 @@ services:
     build:
       context: ./dashboard
       dockerfile: Dockerfile
+      args:
+        INTERNAL_API_URL: http://rota-core:8001
     container_name: rota-dashboard
     restart: unless-stopped
     ports:
       - "3000:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8001
     networks:
       - rota-network
     depends_on:

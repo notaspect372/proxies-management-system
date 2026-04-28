@@ -121,6 +121,14 @@ func (h *HealthHandler) DatabaseHealth(w http.ResponseWriter, r *http.Request) {
 //	@Success		200	{object}	map[string]interface{}	"Database pool statistics"
 //	@Router			/database/stats [get]
 func (h *HealthHandler) DatabaseStats(w http.ResponseWriter, r *http.Request) {
+	if h.db.IsMongo() {
+		h.jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"driver": "mongo",
+			"note":   "connection pool stats are available for postgres only",
+		})
+		return
+	}
+
 	stats := h.db.Stats()
 
 	response := map[string]interface{}{

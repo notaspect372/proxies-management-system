@@ -73,8 +73,22 @@ import {
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { api } from "@/lib/api"
-import { Proxy } from "@/lib/types"
+import { PROXY_CATEGORIES, Proxy, ProxyCategory } from "@/lib/types"
 import { toast } from "@/lib/toast"
+
+const CATEGORY_LABEL: Record<ProxyCategory, string> = {
+  static_residential: "Static Residential",
+  rotating_residential: "Rotating Residential",
+  datacenter: "Datacenter",
+  mobile: "Mobile",
+}
+
+const CATEGORY_TONE: Record<ProxyCategory, string> = {
+  static_residential: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+  rotating_residential: "border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-400",
+  datacenter: "border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400",
+  mobile: "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+}
 
 export default function ProxiesPage() {
   const [data, setData] = React.useState<Proxy[]>([])
@@ -97,12 +111,17 @@ export default function ProxiesPage() {
   const [debouncedSearchQuery, setDebouncedSearchQuery] = React.useState("")
   const [statusFilter, setStatusFilter] = React.useState<string>("all")
   const [protocolFilter, setProtocolFilter] = React.useState<string>("all")
+  const [categoryFilter, setCategoryFilter] = React.useState<string>("all")
+  const [countryFilter, setCountryFilter] = React.useState<string>("")
 
   const [newProxy, setNewProxy] = React.useState({
     address: "",
     protocol: "http" as "http" | "https" | "socks5",
     username: "",
     password: "",
+    category: "" as ProxyCategory | "",
+    cost: "" as string,
+    country: "" as string,
   })
 
   // Import modal states
@@ -110,7 +129,11 @@ export default function ProxiesPage() {
   const [importProtocol, setImportProtocol] = React.useState<"http" | "https" | "socks5">("http")
   const [importUsername, setImportUsername] = React.useState("")
   const [importPassword, setImportPassword] = React.useState("")
-  const [parsedProxies, setParsedProxies] = React.useState<string[]>([])
+  const [importCategory, setImportCategory] = React.useState<ProxyCategory | null>(null)
+  const [importCost, setImportCost] = React.useState<string>("")
+  const [parsedProxies, setParsedProxies] = React.useState<
+    Array<{ address: string; username?: string; password?: string }>
+  >([])
   const [isImporting, setIsImporting] = React.useState(false)
   const [importProgress, setImportProgress] = React.useState({ current: 0, total: 0, success: 0, failed: 0, skipped: 0 })
   const [importResults, setImportResults] = React.useState<Array<{ address: string; status: string; error?: string }>>([])
@@ -118,6 +141,9 @@ export default function ProxiesPage() {
   const [isReloading, setIsReloading] = React.useState(false)
   const [deleteConfirm, setDeleteConfirm] = React.useState<{ open: boolean; proxyId: number | null }>({ open: false, proxyId: null })
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = React.useState(false)
+  const [deleteAllConfirm, setDeleteAllConfirm] = React.useState(false)
+  const [isDeletingAll, setIsDeletingAll] = React.useState(false)
+  const [fetchError, setFetchError] = React.useState<string | null>(null)
 
   // Debounce search query
   React.useEffect(() => {
@@ -143,27 +169,42 @@ export default function ProxiesPage() {
         search: debouncedSearchQuery || undefined,
         status: statusFilter === "all" ? undefined : statusFilter,
         protocol: protocolFilter === "all" ? undefined : protocolFilter,
+        category: categoryFilter === "all" ? undefined : categoryFilter,
+        country: countryFilter.trim() || undefined,
         sort: sortField,
         order: sortOrder as "asc" | "desc" | undefined,
       })
       setData(response.proxies)
       setPagination(response.pagination)
+      setFetchError(null)
     } catch (error) {
-      console.error("Failed to fetch proxies:", error)
+      const message =
+        error instanceof Error ? error.message : "Failed to load proxies"
+      setFetchError(message)
+      toast.error("Could not load proxies", message)
     } finally {
       setIsLoading(false)
     }
-  }, [pagination.page, pagination.limit, debouncedSearchQuery, statusFilter, protocolFilter, sorting])
+  }, [pagination.page, pagination.limit, debouncedSearchQuery, statusFilter, protocolFilter, categoryFilter, countryFilter, sorting])
 
   React.useEffect(() => {
-    fetchProxies()
+    void fetchProxies()
   }, [fetchProxies])
 
   const handleAddProxy = async () => {
     try {
-      await api.addProxy(newProxy)
+      const costNum = parseFloat(newProxy.cost)
+      await api.addProxy({
+        address: newProxy.address,
+        protocol: newProxy.protocol,
+        username: newProxy.username || undefined,
+        password: newProxy.password || undefined,
+        category: newProxy.category || undefined,
+        cost: Number.isFinite(costNum) ? costNum : undefined,
+        country: newProxy.country.trim() || undefined,
+      })
       setIsAddDialogOpen(false)
-      setNewProxy({ address: "", protocol: "http", username: "", password: "" })
+      setNewProxy({ address: "", protocol: "http", username: "", password: "", category: "", cost: "", country: "" })
       toast.success("Proxy added successfully")
       fetchProxies()
     } catch (error) {
@@ -180,6 +221,9 @@ export default function ProxiesPage() {
         address: editingProxy.address,
         protocol: editingProxy.protocol,
         username: editingProxy.username,
+        category: editingProxy.category,
+        cost: editingProxy.cost,
+        country: editingProxy.country,
       })
       setIsEditDialogOpen(false)
       setEditingProxy(null)
@@ -254,6 +298,51 @@ export default function ProxiesPage() {
     }
   }
 
+  const handleDeleteAllProxies = async () => {
+    if (pagination.total === 0) {
+      toast.error("No proxies to delete")
+      return
+    }
+    setDeleteAllConfirm(true)
+  }
+
+  const confirmDeleteAllProxies = async () => {
+    try {
+      setIsDeletingAll(true)
+
+      // Fetch all proxy IDs across pages, then use existing bulk-delete endpoint.
+      const allIds: number[] = []
+      let page = 1
+      let totalPages = 1
+
+      do {
+        const response = await api.getProxies({
+          page,
+          limit: 1000,
+        })
+        allIds.push(...response.proxies.map((proxy) => proxy.id))
+        totalPages = response.pagination.total_pages
+        page += 1
+      } while (page <= totalPages)
+
+      if (allIds.length === 0) {
+        toast.error("No proxies found to delete")
+        return
+      }
+
+      await api.bulkDeleteProxies({ ids: allIds })
+      setRowSelection({})
+      toast.success(`${allIds.length} proxies deleted successfully`)
+      await fetchProxies()
+    } catch (error) {
+      console.error("Failed to delete all proxies:", error)
+      toast.error("Failed to delete all proxies", error instanceof Error ? error.message : "Unknown error")
+    } finally {
+      setIsDeletingAll(false)
+      setDeleteAllConfirm(false)
+    }
+  }
+
   const handleExport = async (format: "txt" | "json" | "csv") => {
     try {
       const blob = await api.exportProxies(format)
@@ -279,16 +368,29 @@ export default function ProxiesPage() {
     const reader = new FileReader()
     reader.onload = (e) => {
       const text = e.target?.result as string
-      const lines = text.split('\n')
+      // Accepts: "host:port" and "host:port:user:pass".
+      // 4-part lines are split so credentials don't end up inside the address.
+      type ParsedProxy = { address: string; username?: string; password?: string }
+      const parsed: ParsedProxy[] = text.split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0)
-        .filter(line => {
-          // Basic validation: IP:PORT format
+        .map((line): ParsedProxy | null => {
           const parts = line.split(':')
-          return parts.length >= 2 && parts[1].match(/^\d+$/)
+          if (parts.length >= 2 && /^\d+$/.test(parts[1])) {
+            if (parts.length >= 4) {
+              return {
+                address: `${parts[0]}:${parts[1]}`,
+                username: parts[2],
+                password: parts.slice(3).join(':'),
+              }
+            }
+            return { address: `${parts[0]}:${parts[1]}` }
+          }
+          return null
         })
+        .filter((p): p is ParsedProxy => p !== null)
 
-      setParsedProxies(lines)
+      setParsedProxies(parsed)
       setImportFile(file)
     }
     reader.readAsText(file)
@@ -332,15 +434,23 @@ export default function ProxiesPage() {
     let failed = 0
     let skipped = 0
 
+    const costNum = parseFloat(importCost)
+    const cost = Number.isFinite(costNum) && costNum >= 0 ? costNum : undefined
+
     for (let i = 0; i < parsedProxies.length; i++) {
-      const address = parsedProxies[i]
+      const entry = parsedProxies[i]
+      const address = entry.address
 
       try {
         await api.addProxy({
           address,
           protocol: importProtocol,
-          username: importUsername || undefined,
-          password: importPassword || undefined,
+          // Per-line credentials from ip:port:user:pass override the dialog defaults
+          username: entry.username ?? (importUsername || undefined),
+          password: entry.password ?? (importPassword || undefined),
+          category: importCategory ?? undefined,
+          cost,
+          // country is auto-detected server-side via GeoIP
         })
 
         success++
@@ -389,9 +499,17 @@ export default function ProxiesPage() {
     setImportProtocol("http")
     setImportUsername("")
     setImportPassword("")
+    setImportCategory(null)
+    setImportCost("")
     setIsImporting(false)
     setImportProgress({ current: 0, total: 0, success: 0, failed: 0, skipped: 0 })
     setImportResults([])
+  }
+
+  const openImportFor = (category: ProxyCategory) => {
+    resetImportDialog()
+    setImportCategory(category)
+    setIsImportDialogOpen(true)
   }
 
   const handleReloadProxies = async () => {
@@ -404,6 +522,26 @@ export default function ProxiesPage() {
       toast.error('Failed to reload proxy pool', error instanceof Error ? error.message : "Unknown error")
     } finally {
       setIsReloading(false)
+    }
+  }
+
+  const handleDetectCountries = async (force: boolean) => {
+    try {
+      toast.success(
+        force ? 'Re-detecting all countries' : 'Detecting countries',
+        'GeoIP lookups run at ~40/min — large pools may take a few minutes.'
+      )
+      const result = await api.detectCountries(force)
+      toast.success(
+        'Detection complete',
+        `Scanned ${result.scanned}, updated ${result.updated}.`
+      )
+      fetchProxies()
+    } catch (error) {
+      toast.error(
+        'Detection failed',
+        error instanceof Error ? error.message : 'Unknown error'
+      )
     }
   }
 
@@ -453,6 +591,39 @@ export default function ProxiesPage() {
           {row.getValue("protocol")}
         </Badge>
       ),
+    },
+    {
+      accessorKey: "category",
+      header: "Type",
+      cell: ({ row }) => {
+        const c = row.original.category
+        if (!c) return <span className="text-muted-foreground text-xs">—</span>
+        return (
+          <span
+            className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${CATEGORY_TONE[c]}`}
+          >
+            {CATEGORY_LABEL[c]}
+          </span>
+        )
+      },
+    },
+    {
+      accessorKey: "cost",
+      header: "Cost",
+      cell: ({ row }) => {
+        const c = row.original.cost
+        if (c === undefined || c === null) return <span className="text-muted-foreground text-xs">—</span>
+        return <div className="tabular-nums">${c.toFixed(2)}</div>
+      },
+    },
+    {
+      accessorKey: "country",
+      header: "Country",
+      cell: ({ row }) => {
+        const c = row.original.country
+        if (!c) return <span className="text-muted-foreground text-xs">—</span>
+        return <div>{c}</div>
+      },
     },
     {
       accessorKey: "status",
@@ -613,12 +784,34 @@ export default function ProxiesPage() {
 
   return (
     <div className="space-y-4">
+      {fetchError && (
+        <div className="flex flex-col gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex gap-3">
+            <AlertCircle className="h-5 w-5 shrink-0 text-destructive" />
+            <div>
+              <p className="font-medium text-destructive">Cannot reach the API</p>
+              <p className="text-sm text-muted-foreground">{fetchError}</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => {
+              setFetchError(null)
+              void fetchProxies()
+            }}
+          >
+            Retry
+          </Button>
+        </div>
+      )}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Proxy Management</h1>
-          <p className="text-muted-foreground">
+          {/* <p className="text-muted-foreground">
             Manage and monitor your proxy infrastructure
-          </p>
+          </p> */}
         </div>
       </div>
 
@@ -652,9 +845,24 @@ export default function ProxiesPage() {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem onClick={() => setIsImportDialogOpen(true)}>
-                    <Upload className="mr-2 h-4 w-4" />
-                    Import from TXT
+                  <DropdownMenuLabel className="text-xs uppercase tracking-wide text-muted-foreground">
+                    Import by Type
+                  </DropdownMenuLabel>
+                  {PROXY_CATEGORIES.map((c) => (
+                    <DropdownMenuItem key={c.value} onClick={() => openImportFor(c.value)}>
+                      <Upload className="mr-2 h-4 w-4" />
+                      {c.label}
+                    </DropdownMenuItem>
+                  ))}
+                  <DropdownMenuSeparator />
+                  <DropdownMenuLabel className="text-xs uppercase tracking-wide text-muted-foreground">
+                    Country
+                  </DropdownMenuLabel>
+                  <DropdownMenuItem onClick={() => handleDetectCountries(false)}>
+                    Detect missing countries
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => handleDetectCountries(true)}>
+                    Re-detect all countries
                   </DropdownMenuItem>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem onClick={() => handleExport("txt")}>
@@ -678,6 +886,14 @@ export default function ProxiesPage() {
                     <Trash2 className="mr-2 h-4 w-4" />
                     Delete selected ({Object.keys(rowSelection).length})
                   </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className="text-red-600"
+                    onClick={handleDeleteAllProxies}
+                    disabled={pagination.total === 0 || isDeletingAll}
+                  >
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    Delete all ({pagination.total})
+                  </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -696,13 +912,36 @@ export default function ProxiesPage() {
                 <DropdownMenuTrigger asChild>
                   <Button variant="outline" size="icon" className="relative">
                     <Filter className="h-4 w-4" />
-                    {(statusFilter !== "all" || protocolFilter !== "all") && (
+                    {(statusFilter !== "all" || protocolFilter !== "all" || categoryFilter !== "all" || countryFilter.trim() !== "") && (
                       <span className="absolute -top-1 -right-1 h-3 w-3 rounded-full bg-primary" />
                     )}
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-56">
                   <DropdownMenuLabel>Filters</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <div className="px-2 py-2">
+                    <Label className="text-xs text-muted-foreground mb-2 block">Type</Label>
+                    <Select
+                      value={categoryFilter}
+                      onValueChange={(value) => {
+                        setCategoryFilter(value)
+                        setPagination(prev => ({ ...prev, page: 1 }))
+                      }}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="All types" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All types</SelectItem>
+                        {PROXY_CATEGORIES.map((c) => (
+                          <SelectItem key={c.value} value={c.value}>
+                            {c.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                   <DropdownMenuSeparator />
                   <div className="px-2 py-2">
                     <Label className="text-xs text-muted-foreground mb-2 block">Status</Label>
@@ -746,6 +985,19 @@ export default function ProxiesPage() {
                         <SelectItem value="socks5">SOCKS5</SelectItem>
                       </SelectContent>
                     </Select>
+                  </div>
+                  <DropdownMenuSeparator />
+                  <div className="px-2 py-2">
+                    <Label className="text-xs text-muted-foreground mb-2 block">Country</Label>
+                    <Input
+                      value={countryFilter}
+                      onChange={(e) => {
+                        setCountryFilter(e.target.value)
+                        setPagination(prev => ({ ...prev, page: 1 }))
+                      }}
+                      placeholder="e.g. US, Germany"
+                      className="h-8"
+                    />
                   </div>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -914,6 +1166,54 @@ export default function ProxiesPage() {
                 onChange={(e) => setNewProxy({ ...newProxy, password: e.target.value })}
               />
             </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="grid gap-2">
+                <Label htmlFor="category">Type</Label>
+                <Select
+                  value={newProxy.category || "none"}
+                  onValueChange={(value) =>
+                    setNewProxy({
+                      ...newProxy,
+                      category: value === "none" ? "" : (value as ProxyCategory),
+                    })
+                  }
+                >
+                  <SelectTrigger id="category">
+                    <SelectValue placeholder="Unspecified" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">Unspecified</SelectItem>
+                    {PROXY_CATEGORIES.map((c) => (
+                      <SelectItem key={c.value} value={c.value}>
+                        {c.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="cost">Cost (USD)</Label>
+                <Input
+                  id="cost"
+                  type="number"
+                  inputMode="decimal"
+                  min="0"
+                  step="0.01"
+                  placeholder="e.g. 30"
+                  value={newProxy.cost}
+                  onChange={(e) => setNewProxy({ ...newProxy, cost: e.target.value })}
+                />
+              </div>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="country">Country (optional)</Label>
+              <Input
+                id="country"
+                placeholder="e.g. US, Germany"
+                value={newProxy.country}
+                onChange={(e) => setNewProxy({ ...newProxy, country: e.target.value })}
+              />
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
@@ -973,6 +1273,65 @@ export default function ProxiesPage() {
                   onChange={(e) => setEditingProxy({ ...editingProxy, username: e.target.value })}
                 />
               </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="grid gap-2">
+                  <Label htmlFor="edit-category">Type</Label>
+                  <Select
+                    value={editingProxy.category || "none"}
+                    onValueChange={(value) =>
+                      setEditingProxy({
+                        ...editingProxy,
+                        category: value === "none" ? undefined : (value as ProxyCategory),
+                      })
+                    }
+                  >
+                    <SelectTrigger id="edit-category">
+                      <SelectValue placeholder="Unspecified" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="none">Unspecified</SelectItem>
+                      {PROXY_CATEGORIES.map((c) => (
+                        <SelectItem key={c.value} value={c.value}>
+                          {c.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="edit-cost">Cost (USD)</Label>
+                  <Input
+                    id="edit-cost"
+                    type="number"
+                    inputMode="decimal"
+                    min="0"
+                    step="0.01"
+                    value={editingProxy.cost ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      const n = parseFloat(v)
+                      setEditingProxy({
+                        ...editingProxy,
+                        cost: v === "" ? undefined : Number.isFinite(n) ? n : editingProxy.cost,
+                      })
+                    }}
+                  />
+                </div>
+              </div>
+              <div className="grid gap-2">
+                <Label htmlFor="edit-country">Country (optional)</Label>
+                <Input
+                  id="edit-country"
+                  placeholder="e.g. US, Germany"
+                  value={editingProxy.country ?? ""}
+                  onChange={(e) =>
+                    setEditingProxy({
+                      ...editingProxy,
+                      country: e.target.value || undefined,
+                    })
+                  }
+                />
+              </div>
             </div>
           )}
           <DialogFooter>
@@ -993,11 +1352,44 @@ export default function ProxiesPage() {
       }}>
         <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Import Proxies from TXT</DialogTitle>
+            <DialogTitle className="flex items-center gap-2">
+              Import {importCategory ? CATEGORY_LABEL[importCategory] : "Proxies"}
+              {importCategory && (
+                <span
+                  className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${CATEGORY_TONE[importCategory]}`}
+                >
+                  {CATEGORY_LABEL[importCategory]}
+                </span>
+              )}
+            </DialogTitle>
             <DialogDescription>
-              Upload a .txt file with proxies in IP:PORT format (one per line)
+              Upload a .txt file with proxies — supports{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">IP:PORT</code> or{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">IP:PORT:USER:PASS</code> per line.
             </DialogDescription>
           </DialogHeader>
+
+          {/* Category switcher chips — let the user retarget the import without closing */}
+          <div className="flex flex-wrap gap-2 pb-2">
+            {PROXY_CATEGORIES.map((c) => {
+              const active = importCategory === c.value
+              return (
+                <button
+                  key={c.value}
+                  type="button"
+                  onClick={() => setImportCategory(c.value)}
+                  disabled={isImporting}
+                  className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                    active
+                      ? CATEGORY_TONE[c.value]
+                      : "border-border bg-card text-muted-foreground hover:bg-accent"
+                  } ${isImporting ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}`}
+                >
+                  {c.label}
+                </button>
+              )
+            })}
+          </div>
 
           <div className="grid gap-4 py-4">
             {!importFile ? (
@@ -1064,7 +1456,12 @@ export default function ProxiesPage() {
                         <div className="font-mono text-sm space-y-1">
                           {parsedProxies.slice(0, 10).map((proxy, idx) => (
                             <div key={idx} className="text-muted-foreground">
-                              {proxy}
+                              {proxy.address}
+                              {proxy.username && (
+                                <span className="ml-2 text-xs opacity-70">
+                                  (auth: {proxy.username})
+                                </span>
+                              )}
                             </div>
                           ))}
                           {parsedProxies.length > 10 && (
@@ -1076,24 +1473,49 @@ export default function ProxiesPage() {
                       </div>
                     </div>
 
-                    <div className="grid gap-2">
-                      <Label htmlFor="import-protocol">Protocol</Label>
-                      <Select
-                        value={importProtocol}
-                        onValueChange={(value: any) => setImportProtocol(value)}
-                        disabled={isImporting}
-                      >
-                        <SelectTrigger>
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="http">HTTP</SelectItem>
-                          <SelectItem value="https">HTTPS</SelectItem>
-                          <SelectItem value="socks4">SOCKS4</SelectItem>
-                          <SelectItem value="socks4a">SOCKS4A</SelectItem>
-                          <SelectItem value="socks5">SOCKS5</SelectItem>
-                        </SelectContent>
-                      </Select>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="grid gap-2">
+                        <Label htmlFor="import-protocol">Protocol</Label>
+                        <Select
+                          value={importProtocol}
+                          onValueChange={(value: any) => setImportProtocol(value)}
+                          disabled={isImporting}
+                        >
+                          <SelectTrigger id="import-protocol">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="http">HTTP</SelectItem>
+                            <SelectItem value="https">HTTPS</SelectItem>
+                            <SelectItem value="socks4">SOCKS4</SelectItem>
+                            <SelectItem value="socks4a">SOCKS4A</SelectItem>
+                            <SelectItem value="socks5">SOCKS5</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="import-cost">Cost (USD)</Label>
+                        <Input
+                          id="import-cost"
+                          type="number"
+                          inputMode="decimal"
+                          min="0"
+                          step="0.01"
+                          placeholder="e.g. 30"
+                          value={importCost}
+                          onChange={(e) => setImportCost(e.target.value)}
+                          disabled={isImporting}
+                        />
+                        <p className="text-[11px] text-muted-foreground">
+                          Applied to every proxy in this batch.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="rounded-md border border-dashed bg-muted/20 p-3 text-xs text-muted-foreground">
+                      <span className="font-medium text-foreground">Country is auto-detected.</span>{" "}
+                      Each proxy&apos;s country is filled in automatically by GeoIP within
+                      a few minutes of import — no need to enter it here.
                     </div>
 
                     <div className="grid gap-2">
@@ -1231,7 +1653,11 @@ export default function ProxiesPage() {
             {importFile && parsedProxies.length > 0 && (
               <Button
                 onClick={handleImport}
-                disabled={isImporting || (importProgress.current === importProgress.total && importProgress.total > 0)}
+                disabled={
+                  isImporting ||
+                  !importCategory ||
+                  (importProgress.current === importProgress.total && importProgress.total > 0)
+                }
               >
                 {isImporting ? (
                   <>
@@ -1240,8 +1666,10 @@ export default function ProxiesPage() {
                   </>
                 ) : importProgress.current === importProgress.total && importProgress.total > 0 ? (
                   'Import Complete'
+                ) : !importCategory ? (
+                  'Pick a type first'
                 ) : (
-                  `Import ${parsedProxies.length} Proxies`
+                  `Import ${parsedProxies.length} as ${CATEGORY_LABEL[importCategory]}`
                 )}
               </Button>
             )}
@@ -1280,6 +1708,35 @@ export default function ProxiesPage() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction onClick={confirmBulkDelete} className="bg-red-600 hover:bg-red-700">
               Delete All
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Delete All Confirmation Dialog */}
+      <AlertDialog open={deleteAllConfirm} onOpenChange={setDeleteAllConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete all {pagination.total} proxies?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This action cannot be undone. This will permanently delete all proxies in your database.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isDeletingAll}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmDeleteAllProxies}
+              className="bg-red-600 hover:bg-red-700"
+              disabled={isDeletingAll}
+            >
+              {isDeletingAll ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Deleting...
+                </>
+              ) : (
+                "Delete All"
+              )}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

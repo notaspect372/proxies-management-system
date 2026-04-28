@@ -19,11 +19,17 @@ type HealthChecker interface {
 	CheckProxy(ctx context.Context, proxy *models.Proxy) (*models.ProxyTestResult, error)
 }
 
+// CountryDetector interface for the manual detect endpoint.
+type CountryDetector interface {
+	RunOnce(ctx context.Context, force bool) (int, int, error)
+}
+
 // ProxyHandler handles proxy management endpoints
 type ProxyHandler struct {
-	proxyRepo     *repository.ProxyRepository
-	healthChecker HealthChecker
-	logger        *logger.Logger
+	proxyRepo       *repository.ProxyRepository
+	healthChecker   HealthChecker
+	countryDetector CountryDetector
+	logger          *logger.Logger
 }
 
 // NewProxyHandler creates a new ProxyHandler
@@ -33,6 +39,42 @@ func NewProxyHandler(proxyRepo *repository.ProxyRepository, healthChecker Health
 		healthChecker: healthChecker,
 		logger:        log,
 	}
+}
+
+// SetCountryDetector wires the optional country-detection backfill service.
+func (h *ProxyHandler) SetCountryDetector(d CountryDetector) {
+	h.countryDetector = d
+}
+
+// DetectCountries triggers a country-detection pass.
+//
+//	@Summary		Detect proxy countries
+//	@Description	Looks up the country for each proxy via GeoIP. By default
+//	@Description	only fills proxies that have no country yet; pass ?force=true
+//	@Description	to overwrite existing values.
+//	@Tags			proxies
+//	@Produce		json
+//	@Param			force	query		bool	false	"Re-detect every proxy"
+//	@Success		200		{object}	map[string]interface{}
+//	@Router			/proxies/detect-countries [post]
+func (h *ProxyHandler) DetectCountries(w http.ResponseWriter, r *http.Request) {
+	if h.countryDetector == nil {
+		h.errorResponse(w, http.StatusServiceUnavailable, "country detector not configured")
+		return
+	}
+	force := r.URL.Query().Get("force") == "true"
+
+	scanned, updated, err := h.countryDetector.RunOnce(r.Context(), force)
+	if err != nil {
+		h.logger.Error("detect countries failed", "error", err)
+		h.errorResponse(w, http.StatusInternalServerError, "detection failed: "+err.Error())
+		return
+	}
+	h.jsonResponse(w, http.StatusOK, map[string]interface{}{
+		"scanned": scanned,
+		"updated": updated,
+		"force":   force,
+	})
 }
 
 // List handles proxy listing with pagination and filters
@@ -65,11 +107,13 @@ func (h *ProxyHandler) List(w http.ResponseWriter, r *http.Request) {
 	search := r.URL.Query().Get("search")
 	status := r.URL.Query().Get("status")
 	protocol := r.URL.Query().Get("protocol")
+	category := r.URL.Query().Get("category")
+	country := r.URL.Query().Get("country")
 	sortField := r.URL.Query().Get("sort")
 	sortOrder := r.URL.Query().Get("order")
 
 	// Get proxies
-	proxies, total, err := h.proxyRepo.List(r.Context(), page, limit, search, status, protocol, sortField, sortOrder)
+	proxies, total, err := h.proxyRepo.List(r.Context(), page, limit, search, status, protocol, category, country, sortField, sortOrder)
 	if err != nil {
 		h.logger.Error("failed to list proxies", "error", err)
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to list proxies")
@@ -362,7 +406,7 @@ func (h *ProxyHandler) Export(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 
 	// Get all proxies
-	proxies, _, err := h.proxyRepo.List(r.Context(), 1, 10000, "", status, "", "created_at", "asc")
+	proxies, _, err := h.proxyRepo.List(r.Context(), 1, 10000, "", status, "", "", "", "created_at", "asc")
 	if err != nil {
 		h.logger.Error("failed to get proxies for export", "error", err)
 		h.errorResponse(w, http.StatusInternalServerError, "Failed to export proxies")

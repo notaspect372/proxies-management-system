@@ -15,13 +15,17 @@ import {
   Network,
   FileText,
   Settings,
-  LogOut,
-  Activity
+  Activity,
 } from "lucide-react"
 
 export function CommandPalette() {
   const [open, setOpen] = React.useState(false)
+  const [mounted, setMounted] = React.useState(false)
   const router = useRouter()
+
+  React.useEffect(() => {
+    setMounted(true)
+  }, [])
 
   React.useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -39,6 +43,10 @@ export function CommandPalette() {
     setOpen(false)
     command()
   }, [])
+
+  if (!mounted) {
+    return null
+  }
 
   return (
     <CommandDialog open={open} onOpenChange={setOpen}>
@@ -75,14 +83,6 @@ export function CommandPalette() {
           >
             <Settings className="mr-2 h-4 w-4" />
             <span>Settings</span>
-          </CommandItem>
-        </CommandGroup>
-        <CommandGroup heading="Actions">
-          <CommandItem
-            onSelect={() => runCommand(() => router.push("/login"))}
-          >
-            <LogOut className="mr-2 h-4 w-4" />
-            <span>Logout</span>
           </CommandItem>
         </CommandGroup>
       </CommandList>

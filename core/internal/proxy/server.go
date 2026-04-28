@@ -3,14 +3,45 @@ package proxy
 import (
 	"context"
 	"fmt"
+	stdLog "log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/repository"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 	"github.com/elazarl/goproxy"
 )
+
+// quietGoproxyLogger drops a small set of well-known goproxy log lines that
+// fire whenever a client (browser/scraper) cancels a request mid-stream.
+// Those events are normal during page navigation/timeouts and don't represent
+// a real error in the proxy. Everything else is forwarded to the standard log.
+type quietGoproxyLogger struct {
+	inner *stdLog.Logger
+}
+
+var quietGoproxyDrops = []string{
+	"Error copying to client",
+	"An existing connection was forcibly closed by the remote host",
+	"connection was aborted by the software in your host machine",
+	"use of closed network connection",
+	"broken pipe",
+	"wsarecv",
+	"wsasend",
+}
+
+func (q *quietGoproxyLogger) Printf(format string, v ...any) {
+	msg := fmt.Sprintf(format, v...)
+	for _, drop := range quietGoproxyDrops {
+		if strings.Contains(msg, drop) {
+			return
+		}
+	}
+	q.inner.Output(2, msg) //nolint:errcheck // logger never errors
+}
 
 // Server represents the proxy server
 type Server struct {
@@ -36,6 +67,7 @@ func New(
 	log *logger.Logger,
 	proxyRepo *repository.ProxyRepository,
 	settingsRepo *repository.SettingsRepository,
+	assignmentRepo *repository.AssignmentRepository,
 ) (*Server, error) {
 	// Load settings
 	ctx := context.Background()
@@ -62,6 +94,7 @@ func New(
 
 	// Create upstream proxy handler
 	handler := NewUpstreamProxyHandler(selector, tracker, &settings.Rotation, log)
+	handler.SetAssignmentRepo(assignmentRepo)
 
 	// Create middlewares
 	authMiddleware := NewAuthMiddleware(settings.Authentication)
@@ -71,16 +104,46 @@ func New(
 	proxyServer := goproxy.NewProxyHttpServer()
 	proxyServer.Verbose = log.Logger.Enabled(context.Background(), -4) // Enable verbose if debug level
 
-	// CRITICAL: Set ConnectDial to route HTTPS through upstream proxy
-	// This is called for ALL CONNECT requests (HTTPS tunneling)
-	proxyServer.ConnectDial = func(network string, addr string) (net.Conn, error) {
-		log.Info("ConnectDial called",
-			"source", "proxy",
-			"network", network,
-			"addr", addr,
-		)
+	// Replace goproxy's default stdlib logger with one that drops harmless
+	// "client cancelled mid-stream" warnings. Real errors still pass through.
+	proxyServer.Logger = &quietGoproxyLogger{
+		inner: stdLog.New(os.Stderr, "", stdLog.LstdFlags),
+	}
 
-		// Connect through upstream proxy with retry logic
+	// CRITICAL: Set ConnectDialWithReq so we get the original CONNECT request
+	// (and its Proxy-Authorization header) for routing-aware proxy selection.
+	// Scrapers using `proxy=main_machine_vm1:Taiwan@host:8006` get a sticky
+	// proxy via AssignmentRepository.Checkout. Anything else falls back to
+	// the existing random/round-robin selector.
+	proxyServer.ConnectDialWithReq = func(req *http.Request, network string, addr string) (net.Conn, error) {
+		if hints, ok := parseRoutingHints(req); ok && assignmentRepo != nil {
+			ctx := context.Background()
+			if req != nil && req.Context() != nil {
+				ctx = req.Context()
+			}
+			picked, sticky, err := assignmentRepo.Checkout(ctx, hints.MachineID, hostOnly(addr), hints.Country)
+			if err != nil {
+				log.Warn("routed CONNECT failed at checkout",
+					"source", "proxy",
+					"addr", addr,
+					"machine_id", hints.MachineID,
+					"country", hints.Country,
+					"error", err,
+				)
+				return nil, fmt.Errorf("checkout failed: %w", err)
+			}
+			log.Info("routed CONNECT",
+				"source", "proxy",
+				"addr", addr,
+				"machine_id", hints.MachineID,
+				"country", hints.Country,
+				"proxy_id", picked.ID,
+				"sticky", sticky,
+			)
+			return handler.ConnectThroughChosenProxy(picked, addr)
+		}
+
+		// Default path: random rotation, exactly as before.
 		conn, _, err := handler.ConnectThroughProxyForDial(addr)
 		if err != nil {
 			log.Error("ConnectDial failed",
@@ -90,11 +153,6 @@ func New(
 			)
 			return nil, err
 		}
-
-		log.Info("ConnectDial succeeded",
-			"source", "proxy",
-			"addr", addr,
-		)
 		return conn, nil
 	}
 
@@ -103,9 +161,18 @@ func New(
 
 	// HTTP requests
 	proxyServer.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		// Authentication middleware
-		if req, resp := authMiddleware.HandleRequest(req, ctx); resp != nil {
-			return req, resp
+		// If the client encoded routing hints in Proxy-Authorization
+		// (e.g. proxy=main_machine_vm1:Taiwan@host), skip the auth check —
+		// those credentials are routing data, not auth.
+		hints, hasHints := parseRoutingHints(req)
+		if !hasHints {
+			if req, resp := authMiddleware.HandleRequest(req, ctx); resp != nil {
+				return req, resp
+			}
+		} else {
+			// Drop the header so it never leaks to the upstream.
+			stripProxyAuth(req)
+			ctx.UserData = hints
 		}
 
 		// Rate limiting middleware
@@ -117,12 +184,20 @@ func New(
 		return handler.HandleRequest(req, ctx)
 	})
 
-	// HTTPS CONNECT requests - middleware only (actual dial handled by ConnectDial above)
+	// HTTPS CONNECT requests - middleware only (actual dial handled by ConnectDialWithReq above)
 	proxyServer.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-		// Authentication middleware
-		if _, resp := authMiddleware.HandleConnect(ctx.Req, ctx); resp != nil {
-			ctx.Resp = resp
-			return goproxy.RejectConnect, host
+		// Same routing-hints bypass for the HTTPS path.
+		hints, hasHints := parseRoutingHints(ctx.Req)
+		if !hasHints {
+			if _, resp := authMiddleware.HandleConnect(ctx.Req, ctx); resp != nil {
+				ctx.Resp = resp
+				return goproxy.RejectConnect, host
+			}
+		} else {
+			ctx.UserData = hints
+			// Note: we leave Proxy-Authorization on ctx.Req so
+			// ConnectDialWithReq can read it, then it isn't forwarded — the
+			// upstream CONNECT we send is built from scratch.
 		}
 
 		// Rate limiting middleware
@@ -131,7 +206,7 @@ func New(
 			return goproxy.RejectConnect, host
 		}
 
-		// Allow CONNECT - actual connection will be made by ConnectDial
+		// Allow CONNECT - actual connection will be made by ConnectDialWithReq
 		return goproxy.OkConnect, host
 	}))
 

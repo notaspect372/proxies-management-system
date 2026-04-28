@@ -101,7 +101,7 @@ export default function SettingsPage() {
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Settings</h1>
           <p className="text-muted-foreground">
-            Configure your Rota proxy rotation system
+            Configure proxy monitoring, rotation, and health checks
           </p>
         </div>
         <div className="flex gap-2">
@@ -591,7 +591,7 @@ export default function SettingsPage() {
               <Label htmlFor="healthcheck-headers">Headers</Label>
               <Textarea
                 id="healthcheck-headers"
-                placeholder="Content-Type: application/json&#10;User-Agent: Rota/1.0"
+                placeholder="Content-Type: application/json&#10;User-Agent: ProxyMonitor-HealthCheck/1.0"
                 value={settings.healthcheck.headers.join("\n")}
                 onChange={(e) =>
                   setSettings({

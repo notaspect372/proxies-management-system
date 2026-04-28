@@ -13,6 +13,7 @@ import (
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/proxy"
 	"github.com/alpkeskin/rota/core/internal/repository"
+	"github.com/alpkeskin/rota/core/internal/services"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -48,6 +49,7 @@ type Server struct {
 	websocketHandler     *handlers.WebSocketHandler
 	metricsHandler       *handlers.MetricsHandler
 	documentationHandler *handlers.DocumentationHandler
+	checkoutHandler      *handlers.CheckoutHandler
 }
 
 // New creates a new API server instance
@@ -57,6 +59,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	logRepo := repository.NewLogRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
 	dashboardRepo := repository.NewDashboardRepository(db)
+	assignmentRepo := repository.NewAssignmentRepository(db)
 
 	// Generate random JWT secret on startup
 	// This ensures all previous tokens become invalid on restart
@@ -74,11 +77,18 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	healthHandler := handlers.NewHealthHandler(db, proxyRepo, log)
 	dashboardHandler := handlers.NewDashboardHandler(dashboardRepo, proxyRepo, log)
 	proxyHandler := handlers.NewProxyHandler(proxyRepo, healthChecker, log)
+
+	// Country detector — fills proxies' country via GeoIP, runs in background
+	// and is also exposed as a manual endpoint.
+	countryDetector := services.NewCountryDetector(proxyRepo, log)
+	countryDetector.Start(context.Background())
+	proxyHandler.SetCountryDetector(countryDetector)
 	logsHandler := handlers.NewLogsHandler(logRepo, log)
 	settingsHandler := handlers.NewSettingsHandler(settingsRepo, log)
 	websocketHandler := handlers.NewWebSocketHandler(dashboardRepo, proxyRepo, logRepo, log)
 	metricsHandler := handlers.NewMetricsHandler(log)
 	documentationHandler := handlers.NewDocumentationHandler()
+	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, log)
 
 	s := &Server{
 		router:               chi.NewRouter(),
@@ -94,6 +104,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		websocketHandler:     websocketHandler,
 		metricsHandler:       metricsHandler,
 		documentationHandler: documentationHandler,
+		checkoutHandler:      checkoutHandler,
 	}
 
 	s.setupMiddleware()
@@ -169,6 +180,12 @@ func (s *Server) setupRoutes() {
 		r.Delete("/proxies/{id}", s.proxyHandler.Delete)
 		r.Post("/proxies/{id}/test", s.proxyHandler.Test)
 		r.Post("/proxies/reload", s.ReloadProxyPool)
+		r.Post("/proxies/detect-countries", s.proxyHandler.DetectCountries)
+
+		// Scraper-facing checkout + dashboard infrastructure
+		r.Get("/proxy", s.checkoutHandler.Checkout)
+		r.Delete("/proxy", s.checkoutHandler.Release)
+		r.Get("/infrastructure", s.checkoutHandler.Infrastructure)
 
 		// System logs
 		r.Get("/logs", s.logsHandler.List)

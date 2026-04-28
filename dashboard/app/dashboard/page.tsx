@@ -24,15 +24,15 @@ import { DashboardStats, ChartDataPoint } from "@/lib/types"
 const chartConfig = {
   value: {
     label: "Response Time",
-    color: "hsl(var(--chart-1))",
+    color: "var(--chart-1)",
   },
   success: {
     label: "Success",
-    color: "hsl(var(--chart-2))",
+    color: "var(--chart-2)",
   },
   failure: {
     label: "Failure",
-    color: "hsl(var(--chart-3))",
+    color: "var(--chart-3)",
   },
 } satisfies ChartConfig
 

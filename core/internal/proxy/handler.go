@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/models"
+	"github.com/alpkeskin/rota/core/internal/repository"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 	"github.com/elazarl/goproxy"
 	"github.com/google/uuid"
@@ -23,6 +24,7 @@ type UpstreamProxyHandler struct {
 	settings        *models.RotationSettings
 	logger          *logger.Logger
 	removeUnhealthy bool
+	assignments     *repository.AssignmentRepository // optional, used for routed requests
 }
 
 // NewUpstreamProxyHandler creates a new upstream proxy handler
@@ -41,6 +43,91 @@ func NewUpstreamProxyHandler(
 	}
 }
 
+// SetAssignmentRepo enables routing-hints-aware proxy selection. When set,
+// requests carrying RoutingHints in their Proxy-Authorization header use a
+// sticky checkout instead of the random selector.
+func (h *UpstreamProxyHandler) SetAssignmentRepo(repo *repository.AssignmentRepository) {
+	h.assignments = repo
+}
+
+// ConnectThroughChosenProxy dials `host` through a specific upstream proxy and
+// records the request. Used by the routing path which already picked a proxy
+// via Checkout instead of via the selector.
+func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host string) (net.Conn, error) {
+	startTime := time.Now()
+	conn, err := h.tryConnectWithRetries(p, host, max(h.settings.Retries, 1))
+	duration := int(time.Since(startTime).Milliseconds())
+
+	go func(success bool, errMsg string) {
+		recordCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		record := RequestRecord{
+			ProxyID:      p.ID,
+			ProxyAddress: p.Address,
+			RequestedURL: "CONNECT://" + host,
+			Method:       "CONNECT",
+			Success:      success,
+			ResponseTime: duration,
+			Timestamp:    startTime,
+		}
+		if success {
+			record.StatusCode = 200
+		} else {
+			record.ErrorMessage = errMsg
+		}
+		_ = h.tracker.RecordRequest(recordCtx, record)
+	}(err == nil, errString(err))
+
+	return conn, err
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// sendViaRoutedProxy honours RoutingHints: pick a proxy via sticky checkout,
+// then send the HTTP request through it with the existing per-proxy retry
+// logic. Mirrors sendWithRetry for the path the routing middleware activates.
+func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context.Context, hints *RoutingHints) (*http.Response, int, error) {
+	if h.assignments == nil {
+		return nil, 0, fmt.Errorf("routing requested but assignment repository is not configured")
+	}
+
+	host := req.URL.Host
+	if host == "" {
+		host = req.Host
+	}
+	domain := hostOnly(host)
+
+	picked, sticky, err := h.assignments.Checkout(ctx, hints.MachineID, domain, hints.Country)
+	if err != nil {
+		return nil, 0, fmt.Errorf("checkout failed: %w", err)
+	}
+
+	h.logger.Info("routed HTTP request",
+		"source", "proxy",
+		"machine_id", hints.MachineID,
+		"country", hints.Country,
+		"domain", domain,
+		"proxy_id", picked.ID,
+		"sticky", sticky,
+	)
+
+	perProxyRetries := h.settings.Retries
+	if perProxyRetries <= 0 {
+		perProxyRetries = 1
+	}
+
+	resp, err := h.tryProxyWithRetries(req, ctx, picked, perProxyRetries)
+	if err != nil {
+		return nil, picked.ID, err
+	}
+	return resp, picked.ID, nil
+}
+
 // HandleRequest handles HTTP requests with upstream proxy rotation
 func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	startTime := time.Now()
@@ -56,8 +143,17 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 	// Remove hop-by-hop headers
 	h.removeHopByHopHeaders(req)
 
-	// Try to send request through proxy pool with retry/fallback
-	resp, proxyID, err := h.sendWithRetry(req, ctx.Req.Context())
+	// If middleware stashed RoutingHints (scraper used
+	// proxy=machine_id:country@host), use sticky checkout instead of the
+	// random selector.
+	var resp *http.Response
+	var proxyID int
+	var err error
+	if hints, ok := ctx.UserData.(*RoutingHints); ok && h.assignments != nil {
+		resp, proxyID, err = h.sendViaRoutedProxy(req, ctx.Req.Context(), hints)
+	} else {
+		resp, proxyID, err = h.sendWithRetry(req, ctx.Req.Context())
+	}
 	duration := int(time.Since(startTime).Milliseconds())
 
 	// Record the request
@@ -652,7 +748,7 @@ func (h *UpstreamProxyHandler) connectViaHTTPProxy(proxy *models.Proxy, host str
 	}
 
 	// Add standard headers
-	connectReq += "User-Agent: Rota-Proxy/1.0\r\n"
+	connectReq += "User-Agent: ProxyMonitor-Upstream/1.0\r\n"
 	connectReq += "Proxy-Connection: Keep-Alive\r\n"
 	connectReq += "\r\n" // Empty line to end headers
 

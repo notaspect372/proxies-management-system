@@ -91,7 +91,7 @@ var migrations = []Migration{
 			('authentication', '{"enabled": false, "username": "", "password": ""}'::jsonb),
 			('rotation', '{"method": "random", "time_based": {"interval": 120}, "remove_unhealthy": true, "fallback": true, "fallback_max_retries": 10, "follow_redirect": false, "timeout": 90, "retries": 3}'::jsonb),
 			('rate_limit', '{"enabled": false, "interval": 1, "max_requests": 100}'::jsonb),
-			('healthcheck', '{"timeout": 60, "workers": 20, "url": "https://api.ipify.org", "status": 200, "headers": ["User-Agent: Rota-HealthCheck/1.0"]}'::jsonb),
+			('healthcheck', '{"timeout": 60, "workers": 20, "url": "https://api.ipify.org", "status": 200, "headers": ["User-Agent: ProxyMonitor-HealthCheck/1.0"]}'::jsonb),
 			('log_retention', '{"enabled": true, "retention_days": 30, "compression_after_days": 7, "cleanup_interval_hours": 24}'::jsonb)
 			ON CONFLICT (key) DO NOTHING;
 		`,
@@ -214,6 +214,58 @@ var migrations = []Migration{
 		`,
 	},
 	{
+		Version:     11,
+		Description: "Add category and cost columns to proxies",
+		Up: `
+			ALTER TABLE proxies ADD COLUMN IF NOT EXISTS category VARCHAR(40);
+			ALTER TABLE proxies ADD COLUMN IF NOT EXISTS cost NUMERIC(12, 4);
+			CREATE INDEX IF NOT EXISTS idx_proxies_category ON proxies(category);
+		`,
+		Down: `
+			DROP INDEX IF EXISTS idx_proxies_category;
+			ALTER TABLE proxies DROP COLUMN IF EXISTS cost;
+			ALTER TABLE proxies DROP COLUMN IF EXISTS category;
+		`,
+	},
+	{
+		Version:     12,
+		Description: "Add country column and proxy_assignments table",
+		Up: `
+			ALTER TABLE proxies ADD COLUMN IF NOT EXISTS country VARCHAR(80);
+			CREATE INDEX IF NOT EXISTS idx_proxies_country ON proxies(country);
+
+			CREATE TABLE IF NOT EXISTS proxy_assignments (
+				id BIGSERIAL PRIMARY KEY,
+				machine_id VARCHAR(120) NOT NULL,
+				domain VARCHAR(255) NOT NULL,
+				proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+				assigned_at TIMESTAMP NOT NULL DEFAULT NOW(),
+				last_used_at TIMESTAMP NOT NULL DEFAULT NOW(),
+				request_count BIGINT NOT NULL DEFAULT 0,
+				CONSTRAINT proxy_assignments_machine_domain_uq UNIQUE (machine_id, domain)
+			);
+			CREATE INDEX IF NOT EXISTS idx_proxy_assignments_machine ON proxy_assignments(machine_id);
+			CREATE INDEX IF NOT EXISTS idx_proxy_assignments_proxy ON proxy_assignments(proxy_id);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS proxy_assignments;
+			DROP INDEX IF EXISTS idx_proxies_country;
+			ALTER TABLE proxies DROP COLUMN IF EXISTS country;
+		`,
+	},
+	{
+		Version:     13,
+		Description: "Add target_country to proxy_assignments",
+		Up: `
+			ALTER TABLE proxy_assignments ADD COLUMN IF NOT EXISTS target_country VARCHAR(80);
+			CREATE INDEX IF NOT EXISTS idx_proxy_assignments_target_country ON proxy_assignments(target_country);
+		`,
+		Down: `
+			DROP INDEX IF EXISTS idx_proxy_assignments_target_country;
+			ALTER TABLE proxy_assignments DROP COLUMN IF EXISTS target_country;
+		`,
+	},
+	{
 		Version:     10,
 		Description: "Update default timeout and retry settings for better proxy compatibility",
 		Up: `
@@ -249,6 +301,15 @@ var migrations = []Migration{
 
 // Migrate runs all pending migrations
 func (db *DB) Migrate(ctx context.Context) error {
+	if db.IsMongo() {
+		db.logger.Info("running mongodb setup")
+		if err := db.MigrateMongo(ctx); err != nil {
+			return fmt.Errorf("failed to setup mongodb: %w", err)
+		}
+		db.logger.Info("mongodb setup completed")
+		return nil
+	}
+
 	db.logger.Info("starting database migrations")
 
 	// Sort migrations by version

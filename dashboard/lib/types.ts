@@ -1,10 +1,46 @@
 // API Response Types
 
+export type ProxyCategory =
+  | "static_residential"
+  | "rotating_residential"
+  | "datacenter"
+  | "mobile"
+
+export const PROXY_CATEGORIES: {
+  value: ProxyCategory
+  label: string
+  description: string
+}[] = [
+  {
+    value: "static_residential",
+    label: "Static Residential",
+    description: "Sticky IPs from real ISP networks",
+  },
+  {
+    value: "rotating_residential",
+    label: "Rotating Residential",
+    description: "Residential IPs rotated per request or session",
+  },
+  {
+    value: "datacenter",
+    label: "Datacenter",
+    description: "Fast datacenter IPs (cheaper, easier to detect)",
+  },
+  {
+    value: "mobile",
+    label: "Mobile",
+    description: "Mobile carrier IPs (4G/5G), highest trust",
+  },
+]
+
 export interface Proxy {
   id: number
   address: string
   protocol: "http" | "https" | "socks4" | "socks4a" | "socks5"
   status: "active" | "failed" | "idle"
+  category?: ProxyCategory
+  cost?: number
+  country?: string
   requests: number
   success_rate: number
   avg_response_time: number
@@ -150,6 +186,9 @@ export interface AddProxyRequest {
   protocol: "http" | "https" | "socks4" | "socks4a" | "socks5"
   username?: string
   password?: string
+  category?: ProxyCategory
+  cost?: number
+  country?: string
 }
 
 export interface UpdateProxyRequest {
@@ -157,6 +196,55 @@ export interface UpdateProxyRequest {
   protocol?: "http" | "https" | "socks4" | "socks4a" | "socks5"
   username?: string
   password?: string
+  category?: ProxyCategory
+  cost?: number
+  country?: string
+}
+
+// Infrastructure / checkout
+export interface InfrastructureAssignment {
+  machine_id: string          // host or VM id
+  domain: string
+  target_country: string
+  assigned_at: string
+  last_used_at: string
+  request_count: number
+  proxy_id: number
+  proxy_address: string
+  proxy_protocol: string
+  proxy_username?: string
+  proxy_status: "active" | "failed" | "idle"
+  proxy_category?: ProxyCategory
+  proxy_country?: string
+  proxy_cost?: number
+  success_rate: number
+  avg_response_time: number
+}
+
+export interface InfrastructureCountryGroup {
+  target_country: string
+  active_count: number
+  total_count: number
+  assignments: InfrastructureAssignment[]
+}
+
+export interface FleetVM {
+  id: string
+  name: string
+}
+
+export interface InfrastructureMachine {
+  id: string
+  name: string
+  hostname: string
+  kind: "main" | "mini"
+  vms: FleetVM[]
+  country_groups: InfrastructureCountryGroup[]
+  total_assignments: number
+}
+
+export interface InfrastructureResponse {
+  machines: InfrastructureMachine[]
 }
 
 export interface BulkProxyRequest {

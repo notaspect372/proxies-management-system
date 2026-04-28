@@ -233,36 +233,14 @@ func (b *BaseSelector) loadActiveProxies(ctx context.Context) ([]*models.Proxy, 
 
 // Helper function to load active proxies from database with settings filters
 func (b *BaseSelector) loadActiveProxiesWithSettings(ctx context.Context, settings *models.RotationSettings) ([]*models.Proxy, error) {
-	// Get all active and idle proxies (not failed)
-	query := `
-		SELECT
-			id, address, protocol, username, password, status,
-			requests, successful_requests, failed_requests,
-			avg_response_time, last_check, last_error, created_at, updated_at
-		FROM proxies
-		WHERE status IN ('active', 'idle')
-		ORDER BY address
-	`
-
-	rows, err := b.repo.GetDB().Pool.Query(ctx, query)
+	proxies, err := b.repo.GetForSelection(ctx, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load proxies: %w", err)
 	}
-	defer rows.Close()
-
-	proxies := make([]*models.Proxy, 0)
-	for rows.Next() {
-		var p models.Proxy
-		err := rows.Scan(
-			&p.ID, &p.Address, &p.Protocol, &p.Username, &p.Password, &p.Status,
-			&p.Requests, &p.SuccessfulRequests, &p.FailedRequests,
-			&p.AvgResponseTime, &p.LastCheck, &p.LastError, &p.CreatedAt, &p.UpdatedAt,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan proxy: %w", err)
-		}
 
 		// Apply filters if settings provided
+	filtered := make([]*models.Proxy, 0, len(proxies))
+	for _, p := range proxies {
 		if settings != nil {
 			// Protocol filter
 			if len(settings.AllowedProtocols) > 0 {
@@ -292,14 +270,14 @@ func (b *BaseSelector) loadActiveProxiesWithSettings(ctx context.Context, settin
 			}
 		}
 
-		proxies = append(proxies, &p)
+		filtered = append(filtered, p)
 	}
 
-	if len(proxies) == 0 {
+	if len(filtered) == 0 {
 		return nil, fmt.Errorf("no active or idle proxies found matching filters")
 	}
 
-	return proxies, nil
+	return filtered, nil
 }
 
 // NewProxySelector creates a proxy selector based on settings

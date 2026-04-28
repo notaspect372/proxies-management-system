@@ -3,10 +3,13 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // DashboardRepository handles dashboard statistics operations
@@ -21,6 +24,10 @@ func NewDashboardRepository(db *database.DB) *DashboardRepository {
 
 // GetStats retrieves overall dashboard statistics
 func (r *DashboardRepository) GetStats(ctx context.Context) (*models.DashboardStats, error) {
+	if r.db.IsMongo() {
+		return r.getStatsMongo(ctx)
+	}
+
 	query := `
 		WITH current_stats AS (
 			SELECT
@@ -84,6 +91,10 @@ func (r *DashboardRepository) GetStats(ctx context.Context) (*models.DashboardSt
 
 // GetResponseTimeChart retrieves response time chart data
 func (r *DashboardRepository) GetResponseTimeChart(ctx context.Context, interval string) ([]models.ChartDataPoint, error) {
+	if r.db.IsMongo() {
+		return r.getResponseTimeChartMongo(ctx, interval)
+	}
+
 	// Determine time bucket based on interval
 	bucketSize := "4 hours"
 	lookback := "24 hours"
@@ -137,6 +148,10 @@ func (r *DashboardRepository) GetResponseTimeChart(ctx context.Context, interval
 
 // GetSuccessRateChart retrieves success rate chart data
 func (r *DashboardRepository) GetSuccessRateChart(ctx context.Context, interval string) ([]models.SuccessRateDataPoint, error) {
+	if r.db.IsMongo() {
+		return r.getSuccessRateChartMongo(ctx, interval)
+	}
+
 	// Determine time bucket based on interval
 	bucketSize := "4 hours"
 	lookback := "24 hours"
@@ -187,4 +202,222 @@ func (r *DashboardRepository) GetSuccessRateChart(ctx context.Context, interval 
 	}
 
 	return data, nil
+}
+
+func (r *DashboardRepository) getStatsMongo(ctx context.Context) (*models.DashboardStats, error) {
+	proxiesCur, err := r.db.MongoDB().Collection("proxies").Find(ctx, bson.M{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to load proxies: %w", err)
+	}
+	defer proxiesCur.Close(ctx)
+
+	var stats models.DashboardStats
+	var successRateSum float64
+	for proxiesCur.Next(ctx) {
+		var p struct {
+			Status          string `bson:"status"`
+			Requests        int64  `bson:"requests"`
+			Successful      int64  `bson:"successful_requests"`
+			AvgResponseTime int    `bson:"avg_response_time"`
+		}
+		if err := proxiesCur.Decode(&p); err != nil {
+			return nil, fmt.Errorf("failed to decode proxy: %w", err)
+		}
+		stats.TotalProxies++
+		if p.Status == "active" {
+			stats.ActiveProxies++
+		}
+		stats.TotalRequests += p.Requests
+		stats.AvgResponseTime += p.AvgResponseTime
+		if p.Requests > 0 {
+			successRateSum += (float64(p.Successful) / float64(p.Requests)) * 100
+		}
+	}
+	if stats.TotalProxies > 0 {
+		stats.AvgResponseTime = stats.AvgResponseTime / stats.TotalProxies
+		stats.AvgSuccessRate = successRateSum / float64(stats.TotalProxies)
+	}
+
+	now := time.Now()
+	todayStart := now.Add(-24 * time.Hour)
+	yesterdayStart := now.Add(-48 * time.Hour)
+
+	var todayCount, yesterdayCount int
+	var todaySuccess, yesterdaySuccess int
+	var todayRespTotal, yesterdayRespTotal int
+
+	reqCur, err := r.db.MongoDB().Collection("proxy_requests").Find(ctx, bson.M{
+		"timestamp": bson.M{"$gte": yesterdayStart},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to load requests: %w", err)
+	}
+	defer reqCur.Close(ctx)
+
+	for reqCur.Next(ctx) {
+		var req struct {
+			Timestamp    time.Time `bson:"timestamp"`
+			Success      bool      `bson:"success"`
+			ResponseTime int       `bson:"response_time"`
+		}
+		if err := reqCur.Decode(&req); err != nil {
+			return nil, fmt.Errorf("failed to decode request: %w", err)
+		}
+		if req.Timestamp.After(todayStart) || req.Timestamp.Equal(todayStart) {
+			todayCount++
+			todayRespTotal += req.ResponseTime
+			if req.Success {
+				todaySuccess++
+			}
+		} else {
+			yesterdayCount++
+			yesterdayRespTotal += req.ResponseTime
+			if req.Success {
+				yesterdaySuccess++
+			}
+		}
+	}
+
+	var todaySuccessRate, yesterdaySuccessRate float64
+	var todayRespAvg, yesterdayRespAvg int
+	if todayCount > 0 {
+		todaySuccessRate = float64(todaySuccess) * 100 / float64(todayCount)
+		todayRespAvg = todayRespTotal / todayCount
+	}
+	if yesterdayCount > 0 {
+		yesterdaySuccessRate = float64(yesterdaySuccess) * 100 / float64(yesterdayCount)
+		yesterdayRespAvg = yesterdayRespTotal / yesterdayCount
+	}
+
+	if yesterdayCount > 0 {
+		stats.RequestGrowth = (float64(todayCount-yesterdayCount) / float64(yesterdayCount)) * 100
+	}
+	stats.SuccessRateGrowth = todaySuccessRate - yesterdaySuccessRate
+	stats.ResponseTimeDelta = todayRespAvg - yesterdayRespAvg
+
+	return &stats, nil
+}
+
+func (r *DashboardRepository) getResponseTimeChartMongo(ctx context.Context, interval string) ([]models.ChartDataPoint, error) {
+	step, lookback := chartInterval(interval)
+	start := time.Now().Add(-lookback)
+
+	cur, err := r.db.MongoDB().Collection("proxy_requests").Find(ctx, bson.M{
+		"timestamp": bson.M{"$gte": start},
+		"success":   true,
+	}, options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load response time chart: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	type agg struct {
+		sum   int
+		count int
+	}
+	buckets := map[time.Time]agg{}
+	for cur.Next(ctx) {
+		var req struct {
+			Timestamp    time.Time `bson:"timestamp"`
+			ResponseTime int       `bson:"response_time"`
+		}
+		if err := cur.Decode(&req); err != nil {
+			return nil, fmt.Errorf("failed to decode chart point: %w", err)
+		}
+		b := truncateTime(req.Timestamp, step)
+		x := buckets[b]
+		x.sum += req.ResponseTime
+		x.count++
+		buckets[b] = x
+	}
+
+	keys := make([]time.Time, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Before(keys[j]) })
+
+	out := make([]models.ChartDataPoint, 0, len(keys))
+	for _, k := range keys {
+		x := buckets[k]
+		v := 0
+		if x.count > 0 {
+			v = x.sum / x.count
+		}
+		out = append(out, models.ChartDataPoint{Time: k.Format("15:04"), Value: v})
+	}
+	return out, nil
+}
+
+func (r *DashboardRepository) getSuccessRateChartMongo(ctx context.Context, interval string) ([]models.SuccessRateDataPoint, error) {
+	step, lookback := chartInterval(interval)
+	start := time.Now().Add(-lookback)
+
+	cur, err := r.db.MongoDB().Collection("proxy_requests").Find(ctx, bson.M{
+		"timestamp": bson.M{"$gte": start},
+	}, options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}}))
+	if err != nil {
+		return nil, fmt.Errorf("failed to load success rate chart: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	type agg struct {
+		total   int
+		success int
+	}
+	buckets := map[time.Time]agg{}
+	for cur.Next(ctx) {
+		var req struct {
+			Timestamp time.Time `bson:"timestamp"`
+			Success   bool      `bson:"success"`
+		}
+		if err := cur.Decode(&req); err != nil {
+			return nil, fmt.Errorf("failed to decode chart point: %w", err)
+		}
+		b := truncateTime(req.Timestamp, step)
+		x := buckets[b]
+		x.total++
+		if req.Success {
+			x.success++
+		}
+		buckets[b] = x
+	}
+
+	keys := make([]time.Time, 0, len(buckets))
+	for k := range buckets {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Before(keys[j]) })
+
+	out := make([]models.SuccessRateDataPoint, 0, len(keys))
+	for _, k := range keys {
+		x := buckets[k]
+		success := 0
+		failure := 0
+		if x.total > 0 {
+			success = (x.success * 100) / x.total
+			failure = 100 - success
+		}
+		out = append(out, models.SuccessRateDataPoint{
+			Time:    k.Format("15:04"),
+			Success: success,
+			Failure: failure,
+		})
+	}
+	return out, nil
+}
+
+func chartInterval(interval string) (time.Duration, time.Duration) {
+	switch interval {
+	case "1h":
+		return time.Hour, 24 * time.Hour
+	case "1d":
+		return 24 * time.Hour, 7 * 24 * time.Hour
+	default:
+		return 4 * time.Hour, 24 * time.Hour
+	}
+}
+
+func truncateTime(t time.Time, step time.Duration) time.Time {
+	return t.UTC().Truncate(step)
 }

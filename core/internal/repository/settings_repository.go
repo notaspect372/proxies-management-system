@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/jackc/pgx/v5"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // SettingsRepository handles settings database operations
@@ -22,6 +26,21 @@ func NewSettingsRepository(db *database.DB) *SettingsRepository {
 
 // Get retrieves a setting by key
 func (r *SettingsRepository) Get(ctx context.Context, key string) (map[string]any, error) {
+	if r.db.IsMongo() {
+		var doc struct {
+			Key   string         `bson:"key"`
+			Value map[string]any `bson:"value"`
+		}
+		err := r.db.MongoDB().Collection("settings").FindOne(ctx, bson.M{"key": key}).Decode(&doc)
+		if err != nil {
+			if err == mongo.ErrNoDocuments {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("failed to get setting: %w", err)
+		}
+		return doc.Value, nil
+	}
+
 	query := `SELECT value FROM settings WHERE key = $1`
 
 	var valueJSON []byte
@@ -45,6 +64,35 @@ func (r *SettingsRepository) Get(ctx context.Context, key string) (map[string]an
 
 // GetAll retrieves all settings
 func (r *SettingsRepository) GetAll(ctx context.Context) (*models.Settings, error) {
+	if r.db.IsMongo() {
+		cursor, err := r.db.MongoDB().Collection("settings").Find(ctx, bson.M{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get all settings: %w", err)
+		}
+		defer cursor.Close(ctx)
+
+		settingsMap := make(map[string]map[string]any)
+		for cursor.Next(ctx) {
+			var doc struct {
+				Key   string         `bson:"key"`
+				Value map[string]any `bson:"value"`
+			}
+			if err := cursor.Decode(&doc); err != nil {
+				return nil, fmt.Errorf("failed to decode setting: %w", err)
+			}
+			settingsMap[doc.Key] = doc.Value
+		}
+
+		if len(settingsMap) == 0 {
+			if err := r.Reset(ctx); err != nil {
+				return nil, err
+			}
+			return r.GetAll(ctx)
+		}
+
+		return r.mapToSettings(settingsMap)
+	}
+
 	query := `SELECT key, value FROM settings`
 
 	rows, err := r.db.Pool.Query(ctx, query)
@@ -76,6 +124,19 @@ func (r *SettingsRepository) GetAll(ctx context.Context) (*models.Settings, erro
 
 // Set updates or creates a setting
 func (r *SettingsRepository) Set(ctx context.Context, key string, value map[string]any) error {
+	if r.db.IsMongo() {
+		_, err := r.db.MongoDB().Collection("settings").UpdateOne(
+			ctx,
+			bson.M{"key": key},
+			bson.M{"$set": bson.M{"value": value, "updated_at": time.Now()}},
+			options.Update().SetUpsert(true),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to set setting: %w", err)
+		}
+		return nil
+	}
+
 	valueJSON, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("failed to marshal value: %w", err)
@@ -144,7 +205,7 @@ func (r *SettingsRepository) Reset(ctx context.Context) error {
 			"workers": 20,
 			"url":     "https://api.ipify.org",
 			"status":  200,
-			"headers": []string{"User-Agent: Rota-HealthCheck/1.0"},
+			"headers": []string{"User-Agent: ProxyMonitor-HealthCheck/1.0"},
 		},
 		"log_retention": {
 			"enabled":                true,

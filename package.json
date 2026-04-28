@@ -1,0 +1,11 @@
+{
+  "name": "proxy-monitoring-system",
+  "private": true,
+  "description": "Run database + API so the dashboard can load (port 8001).",
+  "scripts": {
+    "dev": "npm run dev --prefix dashboard",
+    "backend": "docker compose up -d timescaledb rota-core",
+    "backend:down": "docker compose down",
+    "backend:logs": "docker compose logs -f rota-core"
+  }
+}

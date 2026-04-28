@@ -171,7 +171,7 @@ export default function LogsPage() {
       const url = URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `rota-proxy-logs-${Date.now()}.txt`
+      a.download = `proxy-monitoring-logs-${Date.now()}.txt`
       a.click()
       URL.revokeObjectURL(url)
     } catch (error) {

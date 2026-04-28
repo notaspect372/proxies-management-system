@@ -1,18 +1,25 @@
 import type { Metadata } from "next";
-import { Fira_Code } from "next/font/google";
+import { JetBrains_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
 
-const firaCode = Fira_Code({
+const fontSans = Plus_Jakarta_Sans({
   subsets: ["latin"],
-  variable: "--font-fira-code",
-  weight: ["300", "400", "500", "600", "700"],
+  variable: "--font-sans-primary",
+  weight: ["400", "500", "600", "700"],
+});
+
+const fontMono = JetBrains_Mono({
+  subsets: ["latin"],
+  variable: "--font-mono-code",
+  weight: ["400", "500", "600"],
 });
 
 export const metadata: Metadata = {
-  title: "Rota - Proxy Rotation Dashboard",
-  description: "Intelligent proxy rotation and management system",
+  title: "Proxy Monitoring System",
+  description:
+    "Monitor proxy health, traffic, and rotation in one real-time dashboard",
 };
 
 export default function RootLayout({
@@ -22,7 +29,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${firaCode.variable} font-mono antialiased`}>
+      <body className={`${fontSans.variable} ${fontMono.variable}`}>
         <ThemeProvider
           attribute="class"
           defaultTheme="dark"

@@ -1,7 +1,7 @@
 <div align="center" style="margin-bottom: 20px;">
-  <img src="static/rota_logo.png" alt="rota" width="100px">
+  <img src="static/rota_logo.png" alt="Proxy Monitoring System" width="100px">
   <h1 align="center">
-  Rota - Proxy Rotation Platform
+  Proxy Monitoring System
   </h1>
 </div>
 
@@ -20,9 +20,9 @@
 
 ## 🎯 Overview
 
-**Rota** is a modern, full-stack proxy rotation platform that combines enterprise-grade proxy management with a beautiful, real-time web dashboard. Built with performance and scalability in mind, Rota handles thousands of requests per second while providing comprehensive monitoring, analytics, and control through an intuitive interface.
+**Proxy Monitoring System** is a modern, full-stack proxy monitoring and rotation platform that combines enterprise-grade proxy management with a real-time web dashboard. Built with performance and scalability in mind, it handles high request volumes while providing monitoring, analytics, and control through an intuitive interface.
 
-Whether you're conducting web scraping operations, performing security research, load testing, or need reliable proxy management at scale, Rota delivers a complete solution with:
+Whether you're conducting web scraping operations, performing security research, load testing, or need reliable proxy management at scale, this stack delivers a complete solution with:
 
 - **High-Performance Core**: Lightning-fast Go-based proxy server with intelligent rotation strategies
 - **Real-Time Dashboard**: Modern Next.js web interface with live metrics and monitoring

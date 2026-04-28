@@ -140,6 +140,11 @@ func (s *LogCleanupService) runCleanup(ctx context.Context) error {
 
 // updateRetentionPolicy updates the TimescaleDB retention policy
 func (s *LogCleanupService) updateRetentionPolicy(ctx context.Context, config models.LogRetentionSettings) error {
+	if s.db.IsMongo() {
+		// MongoDB Atlas: retention should be handled via TTL index policy.
+		return nil
+	}
+
 	query := `
 		SELECT remove_retention_policy('logs', if_exists => true);
 		SELECT add_retention_policy('logs', INTERVAL '%d days', if_not_exists => true);
@@ -156,6 +161,11 @@ func (s *LogCleanupService) updateRetentionPolicy(ctx context.Context, config mo
 
 // updateCompressionPolicy updates the TimescaleDB compression policy
 func (s *LogCleanupService) updateCompressionPolicy(ctx context.Context, config models.LogRetentionSettings) error {
+	if s.db.IsMongo() {
+		// MongoDB Atlas handles storage compression automatically.
+		return nil
+	}
+
 	// Remove existing compression policy
 	removeQuery := `SELECT remove_compression_policy('logs', if_exists => true);`
 	if _, err := s.db.Pool.Exec(ctx, removeQuery); err != nil {
