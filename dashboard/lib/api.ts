@@ -338,6 +338,13 @@ class ApiClient {
     return this.request<InfrastructureResponse>("/api/v1/infrastructure")
   }
 
+  async releaseAssignment(machineId: string, domain: string): Promise<void> {
+    const params = new URLSearchParams({ machine_id: machineId, domain })
+    return this.request<void>(`/api/v1/proxy?${params.toString()}`, {
+      method: "DELETE",
+    })
+  }
+
   async getSettings(): Promise<Settings> {
     return this.request<Settings>("/api/v1/settings")
   }

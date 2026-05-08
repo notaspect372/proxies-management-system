@@ -99,9 +99,13 @@ func run() error {
 	if len(cfg.AuxListeners) > 0 {
 		specs := make([]proxy.AuxListenerSpec, 0, len(cfg.AuxListeners))
 		for _, l := range cfg.AuxListeners {
-			specs = append(specs, proxy.AuxListenerSpec{Country: l.Country, Port: l.Port})
+			specs = append(specs, proxy.AuxListenerSpec{
+				MachineID: l.MachineID,
+				Country:   l.Country,
+				Port:      l.Port,
+			})
 		}
-		if err := proxy.StartAuxListeners(cfg.RoutingDefaultMachine, cfg.ProxyPort, specs, log); err != nil {
+		if err := proxy.StartAuxListeners(cfg.RoutingDefaultMachine, cfg.AuxListenAddr, cfg.ProxyPort, specs, log); err != nil {
 			return fmt.Errorf("failed to start aux listeners: %w", err)
 		}
 	}

@@ -27,6 +27,7 @@ import {
   Loader2,
   RefreshCw,
   Flag,
+  Trash2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { api } from "@/lib/api"
@@ -123,6 +124,7 @@ export default function InfrastructurePage() {
   const [selectedMachineId, setSelectedMachineId] = React.useState<string | null>(null)
   const [selectedCountry, setSelectedCountry] = React.useState<string | null>(null)
   const [refreshing, setRefreshing] = React.useState(false)
+  const [removingCountry, setRemovingCountry] = React.useState<string | null>(null)
 
   const load = React.useCallback(async () => {
     try {
@@ -168,6 +170,34 @@ export default function InfrastructurePage() {
     selectedMachine?.country_groups?.find(
       (g) => g.target_country === selectedCountry
     ) ?? null
+
+  const handleRemoveCountry = React.useCallback(
+    async (group: InfrastructureCountryGroup) => {
+      const ok = window.confirm(
+        `Release all ${group.total_count} proxy assignment${
+          group.total_count === 1 ? "" : "s"
+        } for ${group.target_country}? Scrapers will pick fresh proxies on the next checkout.`
+      )
+      if (!ok) return
+      setRemovingCountry(group.target_country)
+      try {
+        await Promise.all(
+          (group.assignments ?? []).map((a) =>
+            api.releaseAssignment(a.machine_id, a.domain)
+          )
+        )
+        if (selectedCountry === group.target_country) {
+          setSelectedCountry(null)
+        }
+        await load()
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to release assignments")
+      } finally {
+        setRemovingCountry(null)
+      }
+    },
+    [load, selectedCountry]
+  )
 
   // Aggregates for the overview strip
   const totals = React.useMemo(() => {
@@ -367,47 +397,74 @@ export default function InfrastructurePage() {
               {selectedMachine?.country_groups?.length ? (
                 selectedMachine.country_groups.map((g) => {
                   const isSelected = g.target_country === selectedCountry
+                  const isRemoving = removingCountry === g.target_country
                   return (
-                    <button
+                    <div
                       key={g.target_country}
-                      onClick={() => setSelectedCountry(g.target_country)}
                       className={cn(
-                        "group mb-1 flex w-full items-center gap-3 rounded-lg border border-transparent px-3 py-2.5 text-left transition-all",
+                        "group mb-1 flex w-full items-center rounded-lg border border-transparent transition-all",
                         "hover:bg-accent hover:border-border",
                         isSelected && "bg-accent border-border shadow-sm"
                       )}
                     >
-                      <div
+                      <button
+                        type="button"
+                        onClick={() => setSelectedCountry(g.target_country)}
+                        className="flex flex-1 min-w-0 items-center gap-3 px-3 py-2.5 text-left"
+                      >
+                        <div
+                          className={cn(
+                            "flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-base",
+                            isSelected
+                              ? "bg-primary/10 border-primary/30 text-primary"
+                              : "bg-muted/50 text-muted-foreground group-hover:text-foreground"
+                          )}
+                        >
+                          <Flag className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="truncate font-medium">{g.target_country}</span>
+                            <Badge
+                              variant="secondary"
+                              className="h-5 px-1.5 text-[10px] uppercase tracking-wide"
+                            >
+                              {g.active_count}/{g.total_count} active
+                            </Badge>
+                          </div>
+                          <div className="mt-0.5 text-xs text-muted-foreground">
+                            {g.total_count} {g.total_count === 1 ? "proxy" : "proxies"} in use
+                          </div>
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void handleRemoveCountry(g)
+                        }}
+                        disabled={isRemoving}
+                        title={`Release all assignments for ${g.target_country}`}
+                        aria-label={`Remove ${g.target_country}`}
                         className={cn(
-                          "flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-base",
-                          isSelected
-                            ? "bg-primary/10 border-primary/30 text-primary"
-                            : "bg-muted/50 text-muted-foreground group-hover:text-foreground"
+                          "mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors",
+                          "hover:bg-destructive/10 hover:text-destructive",
+                          "disabled:opacity-50 disabled:cursor-not-allowed"
                         )}
                       >
-                        <Flag className="h-4 w-4" />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate font-medium">{g.target_country}</span>
-                          <Badge
-                            variant="secondary"
-                            className="h-5 px-1.5 text-[10px] uppercase tracking-wide"
-                          >
-                            {g.active_count}/{g.total_count} active
-                          </Badge>
-                        </div>
-                        <div className="mt-0.5 text-xs text-muted-foreground">
-                          {g.total_count} {g.total_count === 1 ? "proxy" : "proxies"} in use
-                        </div>
-                      </div>
+                        {isRemoving ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Trash2 className="h-4 w-4" />
+                        )}
+                      </button>
                       <ChevronRight
                         className={cn(
-                          "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
+                          "mr-3 h-4 w-4 shrink-0 text-muted-foreground transition-transform",
                           isSelected && "translate-x-0.5 text-foreground"
                         )}
                       />
-                    </button>
+                    </div>
                   )
                 })
               ) : (

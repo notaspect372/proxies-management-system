@@ -15,10 +15,12 @@ import (
 	"github.com/alpkeskin/rota/core/pkg/logger"
 )
 
-// AuxListenerSpec describes one country→port aux listener.
+// AuxListenerSpec describes one (machine, country)→port aux listener. When
+// MachineID is empty the listener falls back to defaultMachineID at start.
 type AuxListenerSpec struct {
-	Country string
-	Port    int
+	MachineID string
+	Country   string
+	Port      int
 }
 
 // StartAuxListeners spawns a credential-injection listener for each spec.
@@ -28,38 +30,53 @@ type AuxListenerSpec struct {
 //	• injects Proxy-Authorization: Basic base64(machineID:Country)
 //	• forwards everything to the main proxy on mainPort
 //
-// Lets a scraper point at a single dedicated port per country
-// (proxy="localhost:8011") without having to embed credentials in the proxy
-// URL — handy when the client (e.g. Chrome under SB UC mode) won't send auth
-// preemptively.
-func StartAuxListeners(machineID string, mainPort int, specs []AuxListenerSpec, log *logger.Logger) error {
-	if machineID == "" || len(specs) == 0 {
+// Lets a scraper point at a single dedicated port per (machine, country)
+// without embedding credentials in the proxy URL — handy when the client
+// (e.g. Chrome under SB UC mode) won't send auth preemptively. The per-spec
+// MachineID overrides defaultMachineID, which is useful when one Rota instance
+// fronts scrapers running as different fleet machines.
+//
+// listenAddr controls the bind interface. Empty string falls back to
+// `127.0.0.1` so we don't accidentally expose the proxy to the LAN.
+func StartAuxListeners(defaultMachineID string, listenAddr string, mainPort int, specs []AuxListenerSpec, log *logger.Logger) error {
+	if len(specs) == 0 {
 		return nil
 	}
-	if !models.IsValidMachineID(machineID) {
-		return fmt.Errorf("aux listeners require a valid ROUTING_DEFAULT_MACHINE; got %q", machineID)
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1"
 	}
 	for _, s := range specs {
-		if err := startOneAuxListener(machineID, s.Country, s.Port, mainPort, log); err != nil {
+		machineID := s.MachineID
+		if machineID == "" {
+			machineID = defaultMachineID
+		}
+		if machineID == "" {
+			return fmt.Errorf("aux listener on port %d has no machine_id and ROUTING_DEFAULT_MACHINE is unset", s.Port)
+		}
+		if !models.IsValidMachineID(machineID) {
+			return fmt.Errorf("aux listener on port %d: unknown machine_id %q", s.Port, machineID)
+		}
+		if err := startOneAuxListener(machineID, s.Country, listenAddr, s.Port, mainPort, log); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func startOneAuxListener(machineID, country string, listenPort, mainPort int, log *logger.Logger) error {
+func startOneAuxListener(machineID, country, listenAddr string, listenPort, mainPort int, log *logger.Logger) error {
 	if country == "" {
 		return fmt.Errorf("aux listener on port %d has empty country", listenPort)
 	}
 	creds := base64.StdEncoding.EncodeToString([]byte(machineID + ":" + country))
 	authHeaderValue := "Basic " + creds
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", listenAddr, listenPort))
 	if err != nil {
-		return fmt.Errorf("aux listener bind on %d: %w", listenPort, err)
+		return fmt.Errorf("aux listener bind on %s:%d: %w", listenAddr, listenPort, err)
 	}
 
 	log.Info("aux routing listener started",
+		"addr", listenAddr,
 		"port", listenPort,
 		"machine_id", machineID,
 		"country", country,

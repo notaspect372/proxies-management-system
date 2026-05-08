@@ -36,13 +36,27 @@ type Config struct {
 	//
 	// Configured via the `AUX_LISTENERS` env var:
 	//   AUX_LISTENERS=India:8011,Taiwan:8012,United States:8013
+	//
+	// Each entry may also override the machine for that listener using the
+	// `machine_id/country:port` form, which is handy when one Rota instance
+	// fronts scrapers running as different fleet machines:
+	//   AUX_LISTENERS=Greece:8015,mini_pc_03/Greece:8016
+	// Entries with no `machine_id/` prefix fall back to RoutingDefaultMachine.
 	AuxListeners []AuxListenerConfig
+
+	// Bind address for aux listeners. Defaults to `127.0.0.1` so listeners
+	// are reachable only from the local box. Set to `0.0.0.0` (LAN-wide) or a
+	// specific NIC IP when scrapers run on remote machines. Configured via
+	// `AUX_LISTEN_ADDR`.
+	AuxListenAddr string
 }
 
-// AuxListenerConfig describes one country→port aux listener.
+// AuxListenerConfig describes one (machine, country)→port aux listener.
+// MachineID is empty when the listener should use RoutingDefaultMachine.
 type AuxListenerConfig struct {
-	Country string
-	Port    int
+	MachineID string
+	Country   string
+	Port      int
 }
 
 // DatabaseConfig holds database configuration
@@ -94,6 +108,7 @@ func Load() (*Config, error) {
 		RoutingDefaultMachine: getEnv("ROUTING_DEFAULT_MACHINE", ""),
 		RoutingDefaultCountry: getEnv("ROUTING_DEFAULT_COUNTRY", ""),
 		AuxListeners:          parseAuxListeners(getEnv("AUX_LISTENERS", "")),
+		AuxListenAddr:         getEnv("AUX_LISTEN_ADDR", "127.0.0.1"),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -156,8 +171,10 @@ func loadDotEnv() {
 	}
 }
 
-// parseAuxListeners turns a comma-separated `Country:Port` list into structured
-// configs. Whitespace around country names is trimmed; bad entries are skipped
+// parseAuxListeners turns a comma-separated list into structured configs.
+// Each entry has the form `[machine_id/]country:port`. The machine_id prefix
+// is optional — when omitted, the listener falls back to RoutingDefaultMachine
+// at startup. Whitespace around fields is trimmed; bad entries are skipped
 // with a stderr warning so a typo in one entry doesn't kill startup.
 func parseAuxListeners(raw string) []AuxListenerConfig {
 	raw = strings.TrimSpace(raw)
@@ -172,20 +189,26 @@ func parseAuxListeners(raw string) []AuxListenerConfig {
 		}
 		i := strings.LastIndex(entry, ":")
 		if i <= 0 || i == len(entry)-1 {
-			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping malformed entry %q (want Country:Port)\n", entry)
+			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping malformed entry %q (want [machine_id/]country:port)\n", entry)
 			continue
 		}
-		country := strings.TrimSpace(entry[:i])
 		port, err := strconv.Atoi(strings.TrimSpace(entry[i+1:]))
 		if err != nil || port < 1 || port > 65535 {
 			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping %q — bad port\n", entry)
 			continue
 		}
+		left := strings.TrimSpace(entry[:i])
+		machineID := ""
+		country := left
+		if slash := strings.Index(left, "/"); slash >= 0 {
+			machineID = strings.TrimSpace(left[:slash])
+			country = strings.TrimSpace(left[slash+1:])
+		}
 		if country == "" {
 			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping %q — empty country\n", entry)
 			continue
 		}
-		out = append(out, AuxListenerConfig{Country: country, Port: port})
+		out = append(out, AuxListenerConfig{MachineID: machineID, Country: country, Port: port})
 	}
 	return out
 }
