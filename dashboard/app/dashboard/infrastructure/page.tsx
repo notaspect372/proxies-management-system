@@ -72,7 +72,15 @@ function StatusDot({ status, pulse = true }: { status: string; pulse?: boolean }
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const label = status.charAt(0).toUpperCase() + status.slice(1)
+  const labels: Record<string, string> = {
+    active: "Healthy",
+    online: "Healthy",
+    failed: "Failed",
+    offline: "Failed",
+    idle: "Idle",
+    degraded: "Degraded",
+  }
+  const label = labels[status] ?? status.charAt(0).toUpperCase() + status.slice(1)
   const variants: Record<string, string> = {
     active: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
     idle: "bg-zinc-500/10 text-zinc-600 dark:text-zinc-400 border-zinc-500/20",
@@ -173,9 +181,10 @@ export default function InfrastructurePage() {
 
   const handleRemoveCountry = React.useCallback(
     async (group: InfrastructureCountryGroup) => {
+      const assignmentCount = group.assignments?.length ?? 0
       const ok = window.confirm(
-        `Release all ${group.total_count} proxy assignment${
-          group.total_count === 1 ? "" : "s"
+        `Release all ${assignmentCount} proxy assignment${
+          assignmentCount === 1 ? "" : "s"
         } for ${group.target_country}? Scrapers will pick fresh proxies on the next checkout.`
       )
       if (!ok) return
@@ -429,7 +438,7 @@ export default function InfrastructurePage() {
                               variant="secondary"
                               className="h-5 px-1.5 text-[10px] uppercase tracking-wide"
                             >
-                              {g.active_count}/{g.total_count} active
+                              {g.active_count}/{g.total_count} healthy
                             </Badge>
                           </div>
                           <div className="mt-0.5 text-xs text-muted-foreground">
@@ -591,7 +600,7 @@ function ProxyList({
         </div>
         <div className="flex items-center gap-4 text-sm">
           <SummaryStat
-            label="Active"
+            label="Healthy"
             value={`${group.active_count}/${group.total_count}`}
           />
           <SummaryStat label="Avg Success" value={`${avgSuccess.toFixed(1)}%`} />

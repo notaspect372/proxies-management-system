@@ -293,5 +293,20 @@ func (db *DB) MigrateMongo(ctx context.Context) error {
 		return fmt.Errorf("failed creating proxy_assignments indexes: %w", err)
 	}
 
+	_, err = database.Collection("proxy_country_bans").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				{Key: "proxy_id", Value: 1},
+				{Key: "machine_id", Value: 1},
+				{Key: "target_country", Value: 1},
+			},
+			Options: options.Index().SetUnique(true),
+		},
+		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "target_country", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed creating proxy_country_bans indexes: %w", err)
+	}
+
 	return nil
 }

@@ -23,12 +23,19 @@ var ErrNoEligibleProxy = errors.New("no eligible proxy")
 // AssignmentRepository owns the proxy_assignments table/collection and the
 // sticky checkout logic.
 type AssignmentRepository struct {
-	db *database.DB
+	db      *database.DB
+	banRepo *BanRepository
 }
 
 func NewAssignmentRepository(db *database.DB) *AssignmentRepository {
 	return &AssignmentRepository{db: db}
 }
+
+// SetBanRepo enables per-(proxy, machine, country) ban filtering in Checkout.
+// When set, sticky assignments whose proxy is currently banned for the scope
+// are abandoned and re-picked, and banned proxies are excluded from the
+// eligible pool.
+func (r *AssignmentRepository) SetBanRepo(b *BanRepository) { r.banRepo = b }
 
 // Checkout returns a proxy for (machine_id, domain). If a sticky assignment
 // already exists and the underlying proxy is still healthy ("active" or
@@ -57,14 +64,23 @@ func (r *AssignmentRepository) Checkout(
 			return nil, false, err
 		}
 		if proxy != nil {
-			if touchErr := r.touchAssignment(ctx, machineID, domain, targetCountry); touchErr != nil {
-				// Non-fatal: stats only.
-				_ = touchErr
+			// Per-scope ban check: if this sticky proxy is currently banned
+			// for the requesting (machine, country), drop the sticky and
+			// pick a fresh one from the eligible pool.
+			banned, err := r.isScopeBanned(ctx, proxy.ID, machineID, targetCountry)
+			if err != nil {
+				return nil, false, err
 			}
-			return proxy, true, nil
+			if !banned {
+				if touchErr := r.touchAssignment(ctx, machineID, domain, targetCountry); touchErr != nil {
+					// Non-fatal: stats only.
+					_ = touchErr
+				}
+				return proxy, true, nil
+			}
 		}
-		// Existing assignment's proxy is gone or unhealthy → fall through and
-		// pick a new one.
+		// Existing assignment's proxy is gone, unhealthy, or banned for this
+		// scope → fall through and pick a new one.
 	}
 
 	// 2. Try the country-preferred pool first; fall back to any healthy proxy.
@@ -77,6 +93,11 @@ func (r *AssignmentRepository) Checkout(
 		if err != nil {
 			return nil, false, err
 		}
+	}
+	// Exclude proxies currently banned for (machine, country).
+	pool, err = r.filterBanned(ctx, pool, machineID, targetCountry)
+	if err != nil {
+		return nil, false, err
 	}
 	if len(pool) == 0 {
 		return nil, false, ErrNoEligibleProxy
@@ -93,6 +114,43 @@ func (r *AssignmentRepository) Checkout(
 	}
 
 	return picked, false, nil
+}
+
+// isScopeBanned returns true when this proxy is currently banned for the
+// given (machine, country). Returns false (without error) when ban tracking
+// isn't wired up or scope is empty — keeps the legacy path working.
+func (r *AssignmentRepository) isScopeBanned(ctx context.Context, proxyID int, machineID, targetCountry string) (bool, error) {
+	if r.banRepo == nil || machineID == "" || targetCountry == "" {
+		return false, nil
+	}
+	return r.banRepo.IsBanned(ctx, BanScope{
+		ProxyID:       proxyID,
+		MachineID:     machineID,
+		TargetCountry: targetCountry,
+	})
+}
+
+// filterBanned removes proxies currently banned for the given (machine,
+// country) scope. When ban tracking is unconfigured or the scope is empty,
+// the input pool is returned unchanged.
+func (r *AssignmentRepository) filterBanned(ctx context.Context, pool []*models.Proxy, machineID, targetCountry string) ([]*models.Proxy, error) {
+	if r.banRepo == nil || machineID == "" || targetCountry == "" || len(pool) == 0 {
+		return pool, nil
+	}
+	banned, err := r.banRepo.BannedProxyIDs(ctx, machineID, targetCountry)
+	if err != nil {
+		return nil, err
+	}
+	if len(banned) == 0 {
+		return pool, nil
+	}
+	out := pool[:0:len(pool)]
+	for _, p := range pool {
+		if !banned[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // ListWithProxies returns every active assignment joined with proxy details.

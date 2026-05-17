@@ -60,6 +60,8 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	settingsRepo := repository.NewSettingsRepository(db)
 	dashboardRepo := repository.NewDashboardRepository(db)
 	assignmentRepo := repository.NewAssignmentRepository(db)
+	banRepo := repository.NewBanRepository(db)
+	assignmentRepo.SetBanRepo(banRepo)
 
 	// Generate random JWT secret on startup
 	// This ensures all previous tokens become invalid on restart
@@ -88,7 +90,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	websocketHandler := handlers.NewWebSocketHandler(dashboardRepo, proxyRepo, logRepo, log)
 	metricsHandler := handlers.NewMetricsHandler(log)
 	documentationHandler := handlers.NewDocumentationHandler()
-	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, log)
+	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, banRepo, log)
 
 	s := &Server{
 		router:               chi.NewRouter(),

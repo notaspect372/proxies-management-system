@@ -52,8 +52,9 @@ func (h *UpstreamProxyHandler) SetAssignmentRepo(repo *repository.AssignmentRepo
 
 // ConnectThroughChosenProxy dials `host` through a specific upstream proxy and
 // records the request. Used by the routing path which already picked a proxy
-// via Checkout instead of via the selector.
-func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host string) (net.Conn, error) {
+// via Checkout instead of via the selector. When machineID + targetCountry are
+// non-empty, the result also feeds the per-scope ban tracker.
+func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, machineID, targetCountry string) (net.Conn, error) {
 	startTime := time.Now()
 	conn, err := h.tryConnectWithRetries(p, host, max(h.settings.Retries, 1))
 	duration := int(time.Since(startTime).Milliseconds())
@@ -62,13 +63,15 @@ func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host s
 		recordCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		record := RequestRecord{
-			ProxyID:      p.ID,
-			ProxyAddress: p.Address,
-			RequestedURL: "CONNECT://" + host,
-			Method:       "CONNECT",
-			Success:      success,
-			ResponseTime: duration,
-			Timestamp:    startTime,
+			ProxyID:       p.ID,
+			ProxyAddress:  p.Address,
+			RequestedURL:  "CONNECT://" + host,
+			Method:        "CONNECT",
+			Success:       success,
+			ResponseTime:  duration,
+			Timestamp:     startTime,
+			MachineID:     machineID,
+			TargetCountry: targetCountry,
 		}
 		if success {
 			record.StatusCode = 200
@@ -166,6 +169,12 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 			Success:      err == nil && resp != nil,
 			ResponseTime: duration,
 			Timestamp:    startTime,
+		}
+		// Carry routing scope through so the tracker can update the
+		// per-(proxy, machine, country) ban table for routed requests.
+		if hints, ok := ctx.UserData.(*RoutingHints); ok && hints != nil {
+			record.MachineID = hints.MachineID
+			record.TargetCountry = hints.Country
 		}
 
 		if resp != nil {

@@ -68,6 +68,7 @@ func New(
 	proxyRepo *repository.ProxyRepository,
 	settingsRepo *repository.SettingsRepository,
 	assignmentRepo *repository.AssignmentRepository,
+	banRepo *repository.BanRepository,
 ) (*Server, error) {
 	// Load settings
 	ctx := context.Background()
@@ -91,6 +92,14 @@ func New(
 
 	// Create usage tracker
 	tracker := NewUsageTracker(proxyRepo)
+	if banRepo != nil {
+		tracker.SetBanRepo(banRepo)
+		assignmentRepo.SetBanRepo(banRepo)
+		log.Info("per-scope ban tracking enabled",
+			"source", "proxy",
+			"cooldown", banRepo.BanDuration().String(),
+		)
+	}
 
 	// Create upstream proxy handler
 	handler := NewUpstreamProxyHandler(selector, tracker, &settings.Rotation, log)
@@ -140,7 +149,7 @@ func New(
 				"proxy_id", picked.ID,
 				"sticky", sticky,
 			)
-			return handler.ConnectThroughChosenProxy(picked, addr)
+			return handler.ConnectThroughChosenProxy(picked, addr, hints.MachineID, hints.Country)
 		}
 
 		// Default path: random rotation, exactly as before.

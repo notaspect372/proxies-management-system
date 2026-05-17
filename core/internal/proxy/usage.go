@@ -11,7 +11,8 @@ import (
 
 // UsageTracker tracks proxy usage and updates statistics
 type UsageTracker struct {
-	repo *repository.ProxyRepository
+	repo   *repository.ProxyRepository
+	banRepo *repository.BanRepository
 }
 
 // NewUsageTracker creates a new usage tracker
@@ -20,6 +21,11 @@ func NewUsageTracker(repo *repository.ProxyRepository) *UsageTracker {
 		repo: repo,
 	}
 }
+
+// SetBanRepo enables per-(proxy,machine,country) ban tracking. When set,
+// RecordRequest will update the ban table for any record that carries a
+// non-empty MachineID + TargetCountry.
+func (t *UsageTracker) SetBanRepo(b *repository.BanRepository) { t.banRepo = b }
 
 // RequestRecord represents a single proxy request
 type RequestRecord struct {
@@ -32,6 +38,12 @@ type RequestRecord struct {
 	StatusCode   int
 	ErrorMessage string
 	Timestamp    time.Time
+
+	// Routing scope — populated when the request came via the routed path
+	// (scraper sent RoutingHints). When both are set, per-scope ban tracking
+	// updates accordingly. Leave empty for non-routed requests.
+	MachineID     string
+	TargetCountry string
 }
 
 // RecordRequest records a proxy request and updates statistics
@@ -50,6 +62,26 @@ func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) 
 			return nil
 		}
 		return fmt.Errorf("failed to update proxy stats: %w", err)
+	}
+
+	// Per-(proxy, machine, country) ban accounting. Only kicks in for routed
+	// requests where the scope is known. A site-specific failure here does
+	// NOT flip the proxy globally — it only bans the scope.
+	if t.banRepo != nil && record.MachineID != "" && record.TargetCountry != "" {
+		scope := repository.BanScope{
+			ProxyID:       record.ProxyID,
+			MachineID:     record.MachineID,
+			TargetCountry: record.TargetCountry,
+		}
+		if record.Success {
+			if err := t.banRepo.RecordSuccess(ctx, scope); err != nil && !shouldIgnoreUsageDBError(err) {
+				return fmt.Errorf("ban repo record success: %w", err)
+			}
+		} else {
+			if err := t.banRepo.RecordFailure(ctx, scope); err != nil && !shouldIgnoreUsageDBError(err) {
+				return fmt.Errorf("ban repo record failure: %w", err)
+			}
+		}
 	}
 
 	return nil

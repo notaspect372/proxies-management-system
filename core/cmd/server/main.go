@@ -77,6 +77,10 @@ func run() error {
 	proxyRepo := repository.NewProxyRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
 	assignmentRepo := repository.NewAssignmentRepository(db)
+	banRepo := repository.NewBanRepository(db)
+	if err := banRepo.EnsureMongoIndexes(ctx); err != nil {
+		log.Warn("failed to ensure proxy_country_bans indexes", "error", err)
+	}
 
 	// Per-machine routing defaults — when set, scrapers can use plain
 	// `proxy=localhost:8006` and routing kicks in based on this machine's
@@ -108,7 +112,7 @@ func run() error {
 	}
 
 	// Create servers
-	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo, assignmentRepo)
+	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo, assignmentRepo, banRepo)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy server: %w", err)
 	}

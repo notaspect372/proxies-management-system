@@ -17,11 +17,12 @@ import (
 // the dashboard infrastructure tree.
 type CheckoutHandler struct {
 	assignments *repository.AssignmentRepository
+	bans        *repository.BanRepository
 	logger      *logger.Logger
 }
 
-func NewCheckoutHandler(assignments *repository.AssignmentRepository, log *logger.Logger) *CheckoutHandler {
-	return &CheckoutHandler{assignments: assignments, logger: log}
+func NewCheckoutHandler(assignments *repository.AssignmentRepository, bans *repository.BanRepository, log *logger.Logger) *CheckoutHandler {
+	return &CheckoutHandler{assignments: assignments, bans: bans, logger: log}
 }
 
 // Checkout handles GET /api/v1/proxy.
@@ -186,16 +187,60 @@ func (h *CheckoutHandler) Infrastructure(w http.ResponseWriter, r *http.Request)
 			}
 			seen[k.country] = true
 
-			active := 0
+			// Count distinct proxies serving this country (a single proxy is
+			// typically reused across many domains, so len(as) inflates the
+			// number well past the actual pool size).
+			seenProxies := map[int]bool{}
+			globallyActive := map[int]bool{}
 			for _, a := range as {
+				seenProxies[a.ProxyID] = true
 				if a.ProxyStatus == "active" {
-					active++
+					globallyActive[a.ProxyID] = true
 				}
 			}
+
+			// "Healthy" for the dashboard means: globally active AND not
+			// currently banned in this (machine, country) scope. A proxy
+			// banned by Spitogatos but happily serving Idealista should
+			// count as healthy in Spain and unhealthy in Greece.
+			activeCount := len(globallyActive)
+			var bannedInScope map[int]bool
+			if h.bans != nil && k.country != "" && k.country != "Untagged" {
+				banned, err := h.bans.BannedProxyIDs(r.Context(), m.ID, k.country)
+				if err != nil {
+					h.logger.Warn("ban lookup failed; falling back to global status only",
+						"source", "infrastructure",
+						"machine_id", m.ID,
+						"country", k.country,
+						"error", err,
+					)
+				} else {
+					bannedInScope = banned
+					for pid := range banned {
+						if globallyActive[pid] {
+							activeCount--
+						}
+					}
+				}
+			}
+
+			// Overlay per-scope ban on each row's status so the UI badge
+			// reflects this country's reality, not the proxy's global state.
+			if len(bannedInScope) > 0 {
+				patched := make([]models.AssignmentWithProxy, len(as))
+				copy(patched, as)
+				for i := range patched {
+					if bannedInScope[patched[i].ProxyID] && patched[i].ProxyStatus == "active" {
+						patched[i].ProxyStatus = "failed"
+					}
+				}
+				as = patched
+			}
+
 			countryGroups = append(countryGroups, models.InfrastructureCountryGroup{
 				TargetCountry: k.country,
-				ActiveCount:   active,
-				TotalCount:    len(as),
+				ActiveCount:   activeCount,
+				TotalCount:    len(seenProxies),
 				Assignments:   as,
 			})
 			total += len(as)

@@ -266,6 +266,28 @@ var migrations = []Migration{
 		`,
 	},
 	{
+		Version:     14,
+		Description: "Add proxy_country_bans for per-(proxy,machine,country) ban tracking",
+		Up: `
+			CREATE TABLE IF NOT EXISTS proxy_country_bans (
+				id BIGSERIAL PRIMARY KEY,
+				proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+				machine_id VARCHAR(120) NOT NULL,
+				target_country VARCHAR(80) NOT NULL,
+				failed_count INTEGER NOT NULL DEFAULT 0,
+				banned_until TIMESTAMP NULL,
+				last_failure_at TIMESTAMP NULL,
+				last_success_at TIMESTAMP NULL,
+				CONSTRAINT proxy_country_bans_scope_uq UNIQUE (proxy_id, machine_id, target_country)
+			);
+			CREATE INDEX IF NOT EXISTS idx_proxy_country_bans_scope
+				ON proxy_country_bans(machine_id, target_country, banned_until);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS proxy_country_bans;
+		`,
+	},
+	{
 		Version:     10,
 		Description: "Update default timeout and retry settings for better proxy compatibility",
 		Up: `
