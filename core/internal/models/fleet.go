@@ -30,6 +30,8 @@ var Fleet = []FleetMachine{
 			{ID: "main_machine_vm1", Name: "VM1"},
 			{ID: "main_machine_vm2", Name: "VM2"},
 			{ID: "main_machine_vm3", Name: "VM3"},
+			{ID: "main_machine_vm4", Name: "VM4"},
+			{ID: "main_machine_vm5", Name: "VM5"},
 		},
 	},
 	{
@@ -43,6 +45,13 @@ var Fleet = []FleetMachine{
 		Name:     "Mini PC 03",
 		Hostname: "mini03.local",
 		Kind:     "mini",
+		VMs: []FleetVM{
+			{ID: "mini_pc_03_vm1", Name: "VM1"},
+			{ID: "mini_pc_03_vm2", Name: "VM2"},
+			{ID: "mini_pc_03_vm3", Name: "VM3"},
+			{ID: "mini_pc_03_vm4", Name: "VM4"},
+			{ID: "mini_pc_03_vm5", Name: "VM5"},
+		},
 	},
 	{
 		ID:       "mini_pc_04",

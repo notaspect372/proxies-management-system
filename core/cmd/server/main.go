@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -37,7 +36,6 @@ import (
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/proxy"
 	"github.com/alpkeskin/rota/core/internal/repository"
-	"github.com/alpkeskin/rota/core/internal/services"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 )
 
@@ -78,7 +76,6 @@ func run() error {
 	// Create repositories
 	proxyRepo := repository.NewProxyRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
-	logRepo := repository.NewLogRepository(db)
 	assignmentRepo := repository.NewAssignmentRepository(db)
 
 	// Per-machine routing defaults — when set, scrapers can use plain
@@ -109,64 +106,6 @@ func run() error {
 			return fmt.Errorf("failed to start aux listeners: %w", err)
 		}
 	}
-
-	// Add database logging hook for proxy logs
-	log.AddHook(func(level, message string, attrs map[string]any) {
-		// Only log proxy-related messages to database
-		source, ok := attrs["source"]
-		if !ok || source != "proxy" {
-			return
-		}
-
-		// Extract details from attributes
-		details := ""
-		if requestID, ok := attrs["request_id"].(string); ok {
-			details += fmt.Sprintf("Request ID: %s\n", requestID)
-		}
-		if method, ok := attrs["method"].(string); ok {
-			details += fmt.Sprintf("Method: %s\n", method)
-		}
-		if url, ok := attrs["url"].(string); ok {
-			details += fmt.Sprintf("URL: %s\n", url)
-		}
-		if proxyID, ok := attrs["proxy_id"].(int); ok {
-			details += fmt.Sprintf("Proxy ID: %d\n", proxyID)
-		}
-		if status, ok := attrs["status"].(int); ok {
-			details += fmt.Sprintf("Status: %d\n", status)
-		}
-		if duration, ok := attrs["duration_ms"].(int); ok {
-			details += fmt.Sprintf("Duration: %dms\n", duration)
-		}
-		if errMsg, ok := attrs["error"]; ok {
-			details += fmt.Sprintf("Error: %v\n", errMsg)
-		}
-
-		// Store in database with timeout
-		dbCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		var detailsPtr *string
-		if details != "" {
-			detailsPtr = &details
-		}
-
-		// Create log entry in database
-		if err := logRepo.Create(dbCtx, level, message, detailsPtr, attrs); err != nil {
-			if isIgnorableMongoWriteError(err) {
-				return
-			}
-			// Don't log errors to avoid infinite loop
-			fmt.Fprintf(os.Stderr, "failed to write log to database: %v\n", err)
-		}
-	})
-
-	// Create and start log cleanup service
-	logCleanupService := services.NewLogCleanupService(db, settingsRepo, log)
-	if err := logCleanupService.Start(ctx); err != nil {
-		log.Warn("failed to start log cleanup service", "error", err)
-	}
-	defer logCleanupService.Stop()
 
 	// Create servers
 	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo, assignmentRepo)
@@ -252,13 +191,3 @@ func run() error {
 	return nil
 }
 
-func isIgnorableMongoWriteError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "context deadline exceeded") ||
-		strings.Contains(msg, "timed out while checking out a connection from connection pool") ||
-		strings.Contains(msg, "client is disconnected") ||
-		strings.Contains(msg, "closed connection pool")
-}
