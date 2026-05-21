@@ -104,6 +104,18 @@ function MachineIcon({ kind, className }: { kind: "main" | "mini"; className?: s
   return <Icon className={className} />
 }
 
+// A country group counts as "live" only if at least one of its proxies has
+// served a request very recently — i.e. traffic is actually flowing right now,
+// not just that the country was registered at some point.
+const LIVE_WINDOW_MS = 2 * 60 * 1000
+function isCountryLive(group: InfrastructureCountryGroup): boolean {
+  const cutoff = Date.now() - LIVE_WINDOW_MS
+  return (group.assignments ?? []).some((a) => {
+    const t = Date.parse(a.last_used_at)
+    return !Number.isNaN(t) && t >= cutoff
+  })
+}
+
 function relativeTime(iso: string): string {
   const t = Date.parse(iso)
   if (Number.isNaN(t)) return "—"
@@ -359,7 +371,6 @@ export default function InfrastructurePage() {
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
-                        <StatusDot status={groups.length ? "online" : "idle"} />
                         <span className="truncate font-medium">{m.name}</span>
                       </div>
                       <div className="mt-0.5 flex items-center gap-2 text-xs text-muted-foreground">
@@ -407,6 +418,7 @@ export default function InfrastructurePage() {
                 selectedMachine.country_groups.map((g) => {
                   const isSelected = g.target_country === selectedCountry
                   const isRemoving = removingCountry === g.target_country
+                  const live = isCountryLive(g)
                   return (
                     <div
                       key={g.target_country}
@@ -433,6 +445,18 @@ export default function InfrastructurePage() {
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
+                            <span
+                              title={
+                                live
+                                  ? "Requests flowing in the last 2 minutes"
+                                  : "No recent requests"
+                              }
+                            >
+                              <StatusDot
+                                status={live ? "active" : "idle"}
+                                pulse={live}
+                              />
+                            </span>
                             <span className="truncate font-medium">{g.target_country}</span>
                             <Badge
                               variant="secondary"
