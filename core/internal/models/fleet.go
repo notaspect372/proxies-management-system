@@ -32,6 +32,13 @@ var Fleet = []FleetMachine{
 			{ID: "main_machine_vm3", Name: "VM3"},
 			{ID: "main_machine_vm4", Name: "VM4"},
 			{ID: "main_machine_vm5", Name: "VM5"},
+			{ID: "main_machine_vm11", Name: "VM11"},
+			{ID: "main_machine_vm13", Name: "VM13"},
+			{ID: "main_machine_vm15", Name: "VM15"},
+			{ID: "main_machine_vm16", Name: "VM16"},
+			{ID: "main_machine_vm17", Name: "VM17"},
+			{ID: "main_machine_vm18", Name: "VM18"},
+			{ID: "main_machine_vm19", Name: "VM19"},
 		},
 	},
 	{

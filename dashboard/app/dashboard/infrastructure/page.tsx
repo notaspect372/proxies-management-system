@@ -346,6 +346,10 @@ export default function InfrastructurePage() {
               {(machines ?? []).map((m) => {
                 const isSelected = m.id === selectedMachineId
                 const groups = m.country_groups ?? []
+                // Count only countries that are actively receiving requests
+                // right now, so the number matches the filtered list in
+                // column 2 (no more "4 countries" when only Russia is live).
+                const liveCount = groups.filter(isCountryLive).length
                 return (
                   <button
                     key={m.id}
@@ -377,11 +381,7 @@ export default function InfrastructurePage() {
                         <span className="truncate font-mono">{m.id}</span>
                         <span className="opacity-50">·</span>
                         <span className="shrink-0">
-                          {groups.length} {groups.length === 1 ? "country" : "countries"}
-                        </span>
-                        <span className="opacity-50">·</span>
-                        <span className="shrink-0">
-                          {m.total_assignments} live
+                          {liveCount} {liveCount === 1 ? "country" : "countries"}
                         </span>
                       </div>
                     </div>
@@ -414,11 +414,51 @@ export default function InfrastructurePage() {
           <Separator />
           <ScrollArea className="flex-1 min-h-[500px]">
             <div className="p-2">
-              {selectedMachine?.country_groups?.length ? (
-                selectedMachine.country_groups.map((g) => {
+              {(() => {
+                // Only show countries with traffic flowing right now.
+                // Stale country groups (last request older than the live
+                // window) are hidden so the dashboard reflects what's
+                // actually scraping, not historical state.
+                const liveGroups = (selectedMachine?.country_groups ?? []).filter(
+                  isCountryLive
+                )
+                if (!selectedMachine) {
+                  return (
+                    <EmptyCol
+                      icon={<Flag className="h-8 w-8" />}
+                      message="Pick a machine on the left"
+                    />
+                  )
+                }
+                if (liveGroups.length === 0) {
+                  return (
+                    <EmptyCol
+                      icon={<Flag className="h-8 w-8" />}
+                      message={`No countries are receiving requests from ${selectedMachine.name} right now.`}
+                    />
+                  )
+                }
+                return liveGroups.map((g) => {
                   const isSelected = g.target_country === selectedCountry
                   const isRemoving = removingCountry === g.target_country
                   const live = isCountryLive(g)
+                  // Which VMs (or the host itself) are actually serving this
+                  // country? Distinct machine_ids on the assignments tell us.
+                  const vmLabels = Array.from(
+                    new Set(
+                      (g.assignments ?? []).map((a) =>
+                        instanceLabel(selectedMachine, a.machine_id)
+                      )
+                    )
+                  ).sort((a, b) => {
+                    // Host OS last, VMs sorted by trailing number when present.
+                    if (a === "Host OS") return 1
+                    if (b === "Host OS") return -1
+                    const na = parseInt(a.replace(/\D/g, ""), 10)
+                    const nb = parseInt(b.replace(/\D/g, ""), 10)
+                    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb
+                    return a.localeCompare(b)
+                  })
                   return (
                     <div
                       key={g.target_country}
@@ -444,8 +484,9 @@ export default function InfrastructurePage() {
                           <Flag className="h-4 w-4" />
                         </div>
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
+                          <div className="flex min-w-0 items-center gap-2">
                             <span
+                              className="shrink-0"
                               title={
                                 live
                                   ? "Requests flowing in the last 2 minutes"
@@ -457,17 +498,44 @@ export default function InfrastructurePage() {
                                 pulse={live}
                               />
                             </span>
-                            <span className="truncate font-medium">{g.target_country}</span>
+                            <span className="min-w-0 truncate font-medium">
+                              {g.target_country}
+                            </span>
                             <Badge
                               variant="secondary"
-                              className="h-5 px-1.5 text-[10px] uppercase tracking-wide"
+                              className="h-5 shrink-0 px-1.5 text-[10px] uppercase tracking-wide"
                             >
                               {g.active_count}/{g.total_count} healthy
                             </Badge>
                           </div>
-                          <div className="mt-0.5 text-xs text-muted-foreground">
-                            {g.total_count} {g.total_count === 1 ? "proxy" : "proxies"} in use
+                          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                            {g.total_count} {g.total_count === 1 ? "proxy" : "proxies"}{" "}
+                            {live ? "in use" : "in used"}
                           </div>
+                          {vmLabels.length > 0 && (
+                            <div className="mt-1 flex flex-wrap items-center gap-1">
+                              {vmLabels.slice(0, 4).map((label) => (
+                                <span
+                                  key={label}
+                                  title={`Served from ${label}`}
+                                  className={cn(
+                                    "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                                    label === "Host OS"
+                                      ? "border-border bg-muted/60 text-muted-foreground"
+                                      : "border-primary/20 bg-primary/10 text-primary"
+                                  )}
+                                >
+                                  <Layers className="h-2.5 w-2.5" />
+                                  {label}
+                                </span>
+                              ))}
+                              {vmLabels.length > 4 && (
+                                <span className="inline-flex items-center rounded-full border bg-muted/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                                  +{vmLabels.length - 4}
+                                </span>
+                              )}
+                            </div>
+                          )}
                         </div>
                       </button>
                       <button
@@ -480,8 +548,8 @@ export default function InfrastructurePage() {
                         title={`Release all assignments for ${g.target_country}`}
                         aria-label={`Remove ${g.target_country}`}
                         className={cn(
-                          "mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors",
-                          "hover:bg-destructive/10 hover:text-destructive",
+                          "ml-1 mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border/40 bg-muted/40 text-foreground/70 transition-colors",
+                          "hover:bg-destructive/10 hover:text-destructive hover:border-destructive/40",
                           "disabled:opacity-50 disabled:cursor-not-allowed"
                         )}
                       >
@@ -500,16 +568,7 @@ export default function InfrastructurePage() {
                     </div>
                   )
                 })
-              ) : (
-                <EmptyCol
-                  icon={<Flag className="h-8 w-8" />}
-                  message={
-                    selectedMachine
-                      ? `No scraper has called /api/v1/proxy?machine_id=${selectedMachine.id}... yet.`
-                      : "Pick a machine on the left"
-                  }
-                />
-              )}
+              })()}
             </div>
           </ScrollArea>
         </Card>
@@ -686,7 +745,6 @@ function AssignmentRow({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <StatusDot status={assignment.proxy_status} />
             <span className="font-mono text-sm font-semibold truncate">
               {assignment.domain}
             </span>
