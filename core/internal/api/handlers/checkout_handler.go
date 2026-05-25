@@ -200,13 +200,13 @@ func (h *CheckoutHandler) Infrastructure(w http.ResponseWriter, r *http.Request)
 			}
 
 			// "Healthy" for the dashboard means: globally active AND not
-			// currently banned in this (machine, country) scope. A proxy
-			// banned by Spitogatos but happily serving Idealista should
-			// count as healthy in Spain and unhealthy in Greece.
+			// currently banned for any site in this country on this
+			// machine. A proxy banned on rumah123.com still counts as
+			// healthy in any country where it isn't banned.
 			activeCount := len(globallyActive)
 			var bannedInScope map[int]bool
 			if h.bans != nil && k.country != "" && k.country != "Untagged" {
-				banned, err := h.bans.BannedProxyIDs(r.Context(), m.ID, k.country)
+				banned, err := h.bans.BannedProxiesForCountry(r.Context(), m.ID, k.country)
 				if err != nil {
 					h.logger.Warn("ban lookup failed; falling back to global status only",
 						"source", "infrastructure",

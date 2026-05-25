@@ -13,6 +13,7 @@ import {
   BulkDeleteRequest,
   ProxyTestResult,
   InfrastructureResponse,
+  CooldownResponse,
 } from "./types"
 
 function stripTrailingSlash(url: string): string {
@@ -343,6 +344,10 @@ class ApiClient {
     return this.request<void>(`/api/v1/proxy?${params.toString()}`, {
       method: "DELETE",
     })
+  }
+
+  async getCooldowns(): Promise<CooldownResponse> {
+    return this.request<CooldownResponse>("/api/v1/cooldowns")
   }
 
   async getSettings(): Promise<Settings> {

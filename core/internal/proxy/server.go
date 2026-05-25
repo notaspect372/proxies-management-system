@@ -95,10 +95,7 @@ func New(
 	if banRepo != nil {
 		tracker.SetBanRepo(banRepo)
 		assignmentRepo.SetBanRepo(banRepo)
-		log.Info("per-scope ban tracking enabled",
-			"source", "proxy",
-			"cooldown", banRepo.BanDuration().String(),
-		)
+		log.Info("per-(proxy,machine,domain) ban tracking enabled", "source", "proxy")
 	}
 
 	// Create upstream proxy handler

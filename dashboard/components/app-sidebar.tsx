@@ -12,6 +12,7 @@ import {
   Command,
   Activity,
   Server,
+  Timer,
 } from "lucide-react"
 import { useTheme } from "next-themes"
 
@@ -49,6 +50,11 @@ const navigation = [
     title: "Infrastructure",
     url: "/dashboard/infrastructure",
     icon: Server,
+  },
+  {
+    title: "Cooldown",
+    url: "/dashboard/cooldown",
+    icon: Timer,
   },
   {
     title: "Proxy Logs",

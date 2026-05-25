@@ -247,6 +247,30 @@ export interface InfrastructureResponse {
   machines: InfrastructureMachine[]
 }
 
+// Cooldown / Recovery Test view — one row per (proxy, machine, domain) scope
+// currently in the banned state.
+export interface CooldownRow {
+  proxy_id: number
+  proxy_address: string
+  target_domain: string
+  target_country?: string
+  machine_id: string
+  state: "active" | "banned"
+  display_state: "active" | "cooldown" | "recovery_test"
+  banned_at?: string
+  next_probe_at?: string
+  cooldown_remaining_sec: number
+  probe_attempt: number
+  successful_since_recovery: number
+  last_probe_at?: string
+  last_failure_at?: string
+}
+
+export interface CooldownResponse {
+  cooldowns: CooldownRow[]
+  total: number
+}
+
 export interface BulkProxyRequest {
   proxies: AddProxyRequest[]
 }

@@ -434,8 +434,15 @@ export default function ProxiesPage() {
     let failed = 0
     let skipped = 0
 
-    const costNum = parseFloat(importCost)
-    const cost = Number.isFinite(costNum) && costNum >= 0 ? costNum : undefined
+    // The user enters the TOTAL cost for the whole batch (e.g. "30" when
+    // importing 100 proxies = $30 spent in total). Split it across every
+    // proxy in the file so each row carries its share — that way the
+    // per-proxy figure displayed in the infrastructure view is correct.
+    const totalCostNum = parseFloat(importCost)
+    const perProxyCost =
+      Number.isFinite(totalCostNum) && totalCostNum >= 0 && parsedProxies.length > 0
+        ? totalCostNum / parsedProxies.length
+        : undefined
 
     for (let i = 0; i < parsedProxies.length; i++) {
       const entry = parsedProxies[i]
@@ -449,7 +456,7 @@ export default function ProxiesPage() {
           username: entry.username ?? (importUsername || undefined),
           password: entry.password ?? (importPassword || undefined),
           category: importCategory ?? undefined,
-          cost,
+          cost: perProxyCost,
           // country is auto-detected server-side via GeoIP
         })
 
@@ -1494,7 +1501,7 @@ export default function ProxiesPage() {
                         </Select>
                       </div>
                       <div className="grid gap-2">
-                        <Label htmlFor="import-cost">Cost (USD)</Label>
+                        <Label htmlFor="import-cost">Total cost for batch (USD)</Label>
                         <Input
                           id="import-cost"
                           type="number"
@@ -1507,7 +1514,9 @@ export default function ProxiesPage() {
                           disabled={isImporting}
                         />
                         <p className="text-[11px] text-muted-foreground">
-                          Applied to every proxy in this batch.
+                          {parsedProxies.length > 0 && importCost && Number.isFinite(parseFloat(importCost)) && parseFloat(importCost) >= 0
+                            ? `= $${(parseFloat(importCost) / parsedProxies.length).toFixed(4)} per proxy (${parsedProxies.length} proxies × per-unit cost)`
+                            : "Total spend for the whole file. Per-proxy cost = total ÷ number of proxies."}
                         </p>
                       </div>
                     </div>
