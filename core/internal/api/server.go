@@ -50,6 +50,7 @@ type Server struct {
 	metricsHandler       *handlers.MetricsHandler
 	documentationHandler *handlers.DocumentationHandler
 	checkoutHandler      *handlers.CheckoutHandler
+	cooldownHandler      *handlers.CooldownHandler
 }
 
 // New creates a new API server instance
@@ -91,6 +92,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	metricsHandler := handlers.NewMetricsHandler(log)
 	documentationHandler := handlers.NewDocumentationHandler()
 	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, banRepo, log)
+	cooldownHandler := handlers.NewCooldownHandler(banRepo, log)
 
 	s := &Server{
 		router:               chi.NewRouter(),
@@ -107,6 +109,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		metricsHandler:       metricsHandler,
 		documentationHandler: documentationHandler,
 		checkoutHandler:      checkoutHandler,
+		cooldownHandler:      cooldownHandler,
 	}
 
 	s.setupMiddleware()
@@ -188,6 +191,7 @@ func (s *Server) setupRoutes() {
 		r.Get("/proxy", s.checkoutHandler.Checkout)
 		r.Delete("/proxy", s.checkoutHandler.Release)
 		r.Get("/infrastructure", s.checkoutHandler.Infrastructure)
+		r.Get("/cooldowns", s.cooldownHandler.List)
 
 		// System logs
 		r.Get("/logs", s.logsHandler.List)

@@ -65,9 +65,9 @@ func (r *AssignmentRepository) Checkout(
 		}
 		if proxy != nil {
 			// Per-scope ban check: if this sticky proxy is currently banned
-			// for the requesting (machine, country), drop the sticky and
+			// for the requesting (machine, domain), drop the sticky and
 			// pick a fresh one from the eligible pool.
-			banned, err := r.isScopeBanned(ctx, proxy.ID, machineID, targetCountry)
+			banned, err := r.isScopeBanned(ctx, proxy.ID, machineID, domain)
 			if err != nil {
 				return nil, false, err
 			}
@@ -94,8 +94,8 @@ func (r *AssignmentRepository) Checkout(
 			return nil, false, err
 		}
 	}
-	// Exclude proxies currently banned for (machine, country).
-	pool, err = r.filterBanned(ctx, pool, machineID, targetCountry)
+	// Exclude proxies currently banned for (machine, domain).
+	pool, err = r.filterBanned(ctx, pool, machineID, domain)
 	if err != nil {
 		return nil, false, err
 	}
@@ -117,27 +117,27 @@ func (r *AssignmentRepository) Checkout(
 }
 
 // isScopeBanned returns true when this proxy is currently banned for the
-// given (machine, country). Returns false (without error) when ban tracking
+// given (machine, domain). Returns false (without error) when ban tracking
 // isn't wired up or scope is empty — keeps the legacy path working.
-func (r *AssignmentRepository) isScopeBanned(ctx context.Context, proxyID int, machineID, targetCountry string) (bool, error) {
-	if r.banRepo == nil || machineID == "" || targetCountry == "" {
+func (r *AssignmentRepository) isScopeBanned(ctx context.Context, proxyID int, machineID, domain string) (bool, error) {
+	if r.banRepo == nil || machineID == "" || domain == "" {
 		return false, nil
 	}
 	return r.banRepo.IsBanned(ctx, BanScope{
-		ProxyID:       proxyID,
-		MachineID:     machineID,
-		TargetCountry: targetCountry,
+		ProxyID:      proxyID,
+		MachineID:    machineID,
+		TargetDomain: domain,
 	})
 }
 
 // filterBanned removes proxies currently banned for the given (machine,
-// country) scope. When ban tracking is unconfigured or the scope is empty,
+// domain) scope. When ban tracking is unconfigured or the scope is empty,
 // the input pool is returned unchanged.
-func (r *AssignmentRepository) filterBanned(ctx context.Context, pool []*models.Proxy, machineID, targetCountry string) ([]*models.Proxy, error) {
-	if r.banRepo == nil || machineID == "" || targetCountry == "" || len(pool) == 0 {
+func (r *AssignmentRepository) filterBanned(ctx context.Context, pool []*models.Proxy, machineID, domain string) ([]*models.Proxy, error) {
+	if r.banRepo == nil || machineID == "" || domain == "" || len(pool) == 0 {
 		return pool, nil
 	}
-	banned, err := r.banRepo.BannedProxyIDs(ctx, machineID, targetCountry)
+	banned, err := r.banRepo.BannedProxyIDsForDomain(ctx, machineID, domain)
 	if err != nil {
 		return nil, err
 	}

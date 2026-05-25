@@ -272,8 +272,13 @@ func (db *DB) MigrateMongo(ctx context.Context) error {
 		return fmt.Errorf("failed creating logs indexes: %w", err)
 	}
 
+	// 7-day TTL on proxy_requests so this collection cannot consume the
+	// cluster's storage cap (it grows ~1 doc per HTTP request through the
+	// proxy — hundreds of thousands per day under load). The unscoped
+	// timestamp index is intentionally TTL-bearing.
+	const proxyRequestTTL = int32(7 * 24 * 60 * 60)
 	_, err = database.Collection("proxy_requests").Indexes().CreateMany(ctx, []mongo.IndexModel{
-		{Keys: bson.D{{Key: "timestamp", Value: -1}}},
+		{Keys: bson.D{{Key: "timestamp", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(proxyRequestTTL)},
 		{Keys: bson.D{{Key: "proxy_id", Value: 1}, {Key: "timestamp", Value: -1}}},
 		{Keys: bson.D{{Key: "success", Value: 1}, {Key: "timestamp", Value: -1}}},
 	})
@@ -293,19 +298,20 @@ func (db *DB) MigrateMongo(ctx context.Context) error {
 		return fmt.Errorf("failed creating proxy_assignments indexes: %w", err)
 	}
 
-	_, err = database.Collection("proxy_country_bans").Indexes().CreateMany(ctx, []mongo.IndexModel{
+	_, err = database.Collection("proxy_domain_bans").Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{
 			Keys: bson.D{
 				{Key: "proxy_id", Value: 1},
 				{Key: "machine_id", Value: 1},
-				{Key: "target_country", Value: 1},
+				{Key: "target_domain", Value: 1},
 			},
 			Options: options.Index().SetUnique(true),
 		},
-		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "target_country", Value: 1}}},
+		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "target_domain", Value: 1}}},
+		{Keys: bson.D{{Key: "state", Value: 1}, {Key: "next_probe_at", Value: 1}}},
 	})
 	if err != nil {
-		return fmt.Errorf("failed creating proxy_country_bans indexes: %w", err)
+		return fmt.Errorf("failed creating proxy_domain_bans indexes: %w", err)
 	}
 
 	return nil

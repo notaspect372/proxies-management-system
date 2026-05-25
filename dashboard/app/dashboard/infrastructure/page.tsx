@@ -104,6 +104,53 @@ function MachineIcon({ kind, className }: { kind: "main" | "mini"; className?: s
   return <Icon className={className} />
 }
 
+// Short pill labels + per-category tone so the four proxy types are easy to
+// scan at a glance. Colors are kept distinct from the success/latency tones
+// so the badge never gets confused with health state.
+const PROXY_CATEGORY_LABELS: Record<string, string> = {
+  static_residential: "Static res",
+  rotating_residential: "Rot res",
+  datacenter: "Datacenter",
+  mobile: "Mobile",
+}
+const PROXY_CATEGORY_TONES: Record<string, string> = {
+  static_residential:
+    "bg-sky-500/10 text-sky-700 dark:text-sky-300 border-sky-500/30",
+  rotating_residential:
+    "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30",
+  datacenter:
+    "bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 border-indigo-500/30",
+  mobile:
+    "bg-orange-500/10 text-orange-700 dark:text-orange-300 border-orange-500/30",
+}
+
+function ProxyCategoryBadge({ category }: { category: string }) {
+  const label = PROXY_CATEGORY_LABELS[category] ?? category
+  const tone =
+    PROXY_CATEGORY_TONES[category] ??
+    "bg-muted text-muted-foreground border-border"
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium",
+        tone
+      )}
+    >
+      {label}
+    </span>
+  )
+}
+
+// Cost can be a tiny per-proxy figure (e.g. $0.0030) after dividing a $30
+// batch across 10,000 proxies, OR a chunkier figure (e.g. $0.30 across
+// 100). Show enough precision that small values aren't rendered as $0.00.
+function formatCost(value: number): string {
+  if (value >= 1) return value.toFixed(2)
+  if (value >= 0.01) return value.toFixed(2)
+  if (value >= 0.0001) return value.toFixed(4)
+  return value.toFixed(6)
+}
+
 // A country group counts as "live" only if at least one of its proxies has
 // served a request very recently — i.e. traffic is actually flowing right now,
 // not just that the country was registered at some point.
@@ -662,6 +709,54 @@ function ProxyList({
   const avgLatency =
     sorted.reduce((s, a) => s + a.avg_response_time, 0) / (sorted.length || 1)
 
+  // Bucket assignments by the worker that owns them (host or VM id). The
+  // user picks a single VM at a time via the tab strip so they can focus
+  // on one worker's behaviour for this country.
+  const lanes = React.useMemo(() => {
+    const map = new Map<string, InfrastructureAssignment[]>()
+    for (const a of sorted) {
+      const list = map.get(a.machine_id) ?? []
+      list.push(a)
+      map.set(a.machine_id, list)
+    }
+    return Array.from(map.entries())
+      .map(([machineId, items]) => {
+        const proxyIds = new Set(items.map((i) => i.proxy_id))
+        const laneSuccess =
+          items.reduce((s, a) => s + a.success_rate, 0) / items.length
+        const laneLatency =
+          items.reduce((s, a) => s + a.avg_response_time, 0) / items.length
+        return {
+          machineId,
+          label: instanceLabel(machine, machineId),
+          items,
+          proxyCount: proxyIds.size,
+          successAvg: laneSuccess,
+          latencyAvg: laneLatency,
+        }
+      })
+      .sort((a, b) => {
+        // Pin "Host OS" first; otherwise natural-numeric sort by label.
+        if (a.machineId === machine.id) return -1
+        if (b.machineId === machine.id) return 1
+        return a.label.localeCompare(b.label, undefined, { numeric: true })
+      })
+  }, [sorted, machine])
+
+  const [selectedVM, setSelectedVM] = React.useState<string | null>(null)
+  // Reset / auto-pick the VM when the country changes or the set of lanes
+  // shifts (e.g. a VM stops scraping this country).
+  React.useEffect(() => {
+    if (lanes.length === 0) {
+      setSelectedVM(null)
+      return
+    }
+    setSelectedVM((curr) => {
+      if (curr && lanes.some((l) => l.machineId === curr)) return curr
+      return lanes[0].machineId
+    })
+  }, [lanes])
+
   if (sorted.length === 0) {
     return (
       <EmptyCol
@@ -670,6 +765,8 @@ function ProxyList({
       />
     )
   }
+
+  const activeLane = lanes.find((l) => l.machineId === selectedVM) ?? lanes[0]
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -691,20 +788,92 @@ function ProxyList({
         </div>
       </div>
 
-      <ScrollArea className="flex-1">
-        <div className="space-y-2 pr-2">
-          {sorted.map((a) => (
-            <AssignmentRow
-              key={`${a.machine_id}-${a.domain}`}
-              assignment={a}
-              instance={instanceLabel(machine, a.machine_id)}
-            />
-          ))}
-        </div>
-      </ScrollArea>
+      {/* VM tab strip — one tab per worker (host + each VM) that is
+          actually scraping this country. */}
+      <div className="flex flex-wrap items-center gap-1 border-b">
+        {lanes.map((lane) => {
+          const isActive = lane.machineId === activeLane?.machineId
+          return (
+            <button
+              key={lane.machineId}
+              onClick={() => setSelectedVM(lane.machineId)}
+              className={cn(
+                "flex items-center gap-2 border-b-2 px-3 py-2 text-sm transition-colors",
+                isActive
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              )}
+            >
+              <Layers className="h-3.5 w-3.5" />
+              <span className="font-medium">{lane.label}</span>
+              <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+                {lane.proxyCount}
+              </span>
+            </button>
+          )
+        })}
+      </div>
+
+      {activeLane && (
+        <>
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/20 px-3 py-2">
+            <div className="flex items-center gap-2 text-sm">
+              <Layers className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="font-semibold">{activeLane.label}</span>
+              <span className="text-xs text-muted-foreground">
+                · {activeLane.proxyCount}{" "}
+                {activeLane.proxyCount === 1 ? "proxy" : "proxies"}
+              </span>
+            </div>
+            <div className="flex items-center gap-4 text-xs">
+              <span
+                className={cn(
+                  "tabular-nums font-medium",
+                  laneSuccessTone(activeLane.successAvg)
+                )}
+              >
+                {activeLane.successAvg.toFixed(1)}% success
+              </span>
+              <span
+                className={cn(
+                  "tabular-nums font-medium",
+                  laneLatencyTone(activeLane.latencyAvg)
+                )}
+              >
+                {Math.round(activeLane.latencyAvg)}ms avg
+              </span>
+            </div>
+          </div>
+
+          <ScrollArea className="flex-1">
+            <div className="space-y-2 pr-2">
+              {activeLane.items.map((a) => (
+                <AssignmentRow
+                  key={`${a.machine_id}-${a.domain}`}
+                  assignment={a}
+                />
+              ))}
+            </div>
+          </ScrollArea>
+        </>
+      )}
     </div>
   )
 }
+
+function laneSuccessTone(s: number): string {
+  if (s >= 95) return "text-emerald-600 dark:text-emerald-400"
+  if (s >= 80) return "text-amber-600 dark:text-amber-400"
+  return "text-red-600 dark:text-red-400"
+}
+
+function laneLatencyTone(ms: number): string {
+  if (ms === 0) return "text-muted-foreground"
+  if (ms < 200) return "text-emerald-600 dark:text-emerald-400"
+  if (ms < 500) return "text-amber-600 dark:text-amber-400"
+  return "text-red-600 dark:text-red-400"
+}
+
 
 function SummaryStat({ label, value }: { label: string; value: string }) {
   return (
@@ -719,10 +888,8 @@ function SummaryStat({ label, value }: { label: string; value: string }) {
 
 function AssignmentRow({
   assignment,
-  instance,
 }: {
   assignment: InfrastructureAssignment
-  instance: string
 }) {
   const successTone =
     assignment.success_rate >= 95
@@ -744,16 +911,24 @@ function AssignmentRow({
     <div className="rounded-lg border bg-card p-3 transition-colors hover:border-foreground/20">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="font-mono text-sm font-semibold truncate">
               {assignment.domain}
             </span>
             <Badge
               variant="outline"
-              className="font-mono text-[10px] uppercase tracking-wide"
+              className="font-mono text-xs uppercase tracking-wide px-2 py-0.5"
             >
               {assignment.proxy_protocol}
             </Badge>
+            {assignment.proxy_category && (
+              <ProxyCategoryBadge category={assignment.proxy_category} />
+            )}
+            {typeof assignment.proxy_cost === "number" && assignment.proxy_cost > 0 && (
+              <span className="text-sm font-semibold tabular-nums text-emerald-600 dark:text-emerald-400">
+                ${formatCost(assignment.proxy_cost)}
+              </span>
+            )}
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
             <span className="font-mono">{assignment.proxy_address}</span>
@@ -763,10 +938,6 @@ function AssignmentRow({
                 proxy: {assignment.proxy_country}
               </span>
             )}
-            <span className="flex items-center gap-1">
-              <Layers className="h-3 w-3" />
-              {instance}
-            </span>
             <span className="flex items-center gap-1">
               <Clock className="h-3 w-3" />
               {relativeTime(assignment.last_used_at)}

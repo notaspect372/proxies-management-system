@@ -52,13 +52,14 @@ func (h *UpstreamProxyHandler) SetAssignmentRepo(repo *repository.AssignmentRepo
 
 // ConnectThroughChosenProxy dials `host` through a specific upstream proxy and
 // records the request. Used by the routing path which already picked a proxy
-// via Checkout instead of via the selector. When machineID + targetCountry are
+// via Checkout instead of via the selector. When machineID + targetDomain are
 // non-empty, the result also feeds the per-scope ban tracker.
 func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, machineID, targetCountry string) (net.Conn, error) {
 	startTime := time.Now()
 	conn, err := h.tryConnectWithRetries(p, host, max(h.settings.Retries, 1))
 	duration := int(time.Since(startTime).Milliseconds())
 
+	domain := hostOnly(host)
 	go func(success bool, errMsg string) {
 		recordCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -71,6 +72,7 @@ func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, 
 			ResponseTime:  duration,
 			Timestamp:     startTime,
 			MachineID:     machineID,
+			TargetDomain:  domain,
 			TargetCountry: targetCountry,
 		}
 		if success {
@@ -171,10 +173,15 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 			Timestamp:    startTime,
 		}
 		// Carry routing scope through so the tracker can update the
-		// per-(proxy, machine, country) ban table for routed requests.
+		// per-(proxy, machine, domain) ban table for routed requests.
 		if hints, ok := ctx.UserData.(*RoutingHints); ok && hints != nil {
 			record.MachineID = hints.MachineID
 			record.TargetCountry = hints.Country
+			host := req.URL.Host
+			if host == "" {
+				host = req.Host
+			}
+			record.TargetDomain = hostOnly(host)
 		}
 
 		if resp != nil {

@@ -288,6 +288,39 @@ var migrations = []Migration{
 		`,
 	},
 	{
+		Version:     15,
+		Description: "Add proxy_domain_bans (per-(proxy,machine,domain) lifecycle with probe state machine)",
+		Up: `
+			CREATE TABLE IF NOT EXISTS proxy_domain_bans (
+				id BIGSERIAL PRIMARY KEY,
+				proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+				machine_id VARCHAR(120) NOT NULL,
+				target_domain VARCHAR(255) NOT NULL,
+				target_country VARCHAR(80) NULL,
+				state VARCHAR(20) NOT NULL DEFAULT 'active',
+				failed_count INTEGER NOT NULL DEFAULT 0,
+				banned_at TIMESTAMP NULL,
+				next_probe_at TIMESTAMP NULL,
+				probe_attempt INTEGER NOT NULL DEFAULT 0,
+				last_probe_at TIMESTAMP NULL,
+				last_failure_at TIMESTAMP NULL,
+				last_success_at TIMESTAMP NULL,
+				successful_since_recovery INTEGER NOT NULL DEFAULT 0,
+				recovery_history JSONB NOT NULL DEFAULT '[]',
+				CONSTRAINT proxy_domain_bans_scope_uq UNIQUE (proxy_id, machine_id, target_domain)
+			);
+			CREATE INDEX IF NOT EXISTS idx_proxy_domain_bans_md
+				ON proxy_domain_bans(machine_id, target_domain);
+			CREATE INDEX IF NOT EXISTS idx_proxy_domain_bans_country
+				ON proxy_domain_bans(machine_id, target_country);
+			CREATE INDEX IF NOT EXISTS idx_proxy_domain_bans_probe
+				ON proxy_domain_bans(state, next_probe_at);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS proxy_domain_bans;
+		`,
+	},
+	{
 		Version:     10,
 		Description: "Update default timeout and retry settings for better proxy compatibility",
 		Up: `

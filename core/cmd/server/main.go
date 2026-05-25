@@ -79,8 +79,15 @@ func run() error {
 	assignmentRepo := repository.NewAssignmentRepository(db)
 	banRepo := repository.NewBanRepository(db)
 	if err := banRepo.EnsureMongoIndexes(ctx); err != nil {
-		log.Warn("failed to ensure proxy_country_bans indexes", "error", err)
+		log.Warn("failed to ensure proxy_domain_bans indexes", "error", err)
 	}
+
+	// Background probe worker — drives the Recovery Test phase of the proxy
+	// lifecycle. Picks up banned scopes whose next_probe_at has fired and
+	// sends a real GET to the domain to decide whether the ban has lifted.
+	probeWorker := proxy.NewProbeWorker(banRepo, log)
+	probeWorker.Start(ctx)
+	defer probeWorker.Stop()
 
 	// Per-machine routing defaults — when set, scrapers can use plain
 	// `proxy=localhost:8006` and routing kicks in based on this machine's

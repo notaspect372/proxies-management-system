@@ -40,9 +40,12 @@ type RequestRecord struct {
 	Timestamp    time.Time
 
 	// Routing scope — populated when the request came via the routed path
-	// (scraper sent RoutingHints). When both are set, per-scope ban tracking
-	// updates accordingly. Leave empty for non-routed requests.
+	// (scraper sent RoutingHints). When MachineID + TargetDomain are set,
+	// per-scope ban tracking updates accordingly. TargetCountry is stored
+	// on the ban record for dashboard rollup but isn't part of the scope
+	// identity. Leave empty for non-routed requests.
 	MachineID     string
+	TargetDomain  string
 	TargetCountry string
 }
 
@@ -64,13 +67,14 @@ func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) 
 		return fmt.Errorf("failed to update proxy stats: %w", err)
 	}
 
-	// Per-(proxy, machine, country) ban accounting. Only kicks in for routed
+	// Per-(proxy, machine, domain) ban accounting. Only kicks in for routed
 	// requests where the scope is known. A site-specific failure here does
 	// NOT flip the proxy globally — it only bans the scope.
-	if t.banRepo != nil && record.MachineID != "" && record.TargetCountry != "" {
+	if t.banRepo != nil && record.MachineID != "" && record.TargetDomain != "" {
 		scope := repository.BanScope{
 			ProxyID:       record.ProxyID,
 			MachineID:     record.MachineID,
+			TargetDomain:  record.TargetDomain,
 			TargetCountry: record.TargetCountry,
 		}
 		if record.Success {
