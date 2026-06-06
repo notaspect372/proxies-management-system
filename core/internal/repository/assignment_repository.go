@@ -461,7 +461,15 @@ func (r *AssignmentRepository) listWithProxiesPG(ctx context.Context) ([]models.
 }
 
 func (r *AssignmentRepository) listWithProxiesMongo(ctx context.Context) ([]models.AssignmentWithProxy, error) {
-	cur, err := r.db.MongoDB().Collection("proxy_assignments").Find(ctx, bson.M{})
+	// Only pull assignments touched in the last 24 hours. On Atlas free tier
+	// a full pull of all sticky assignments (90% of which are days/weeks old
+	// and never refreshed) takes ~55s and times out the dashboard. The UI
+	// only shows assignments live in the last 2 minutes anyway, so 24h is a
+	// generous safety window.
+	cutoff := time.Now().Add(-24 * time.Hour)
+	cur, err := r.db.MongoDB().Collection("proxy_assignments").Find(ctx, bson.M{
+		"last_used_at": bson.M{"$gte": cutoff},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -473,6 +481,24 @@ func (r *AssignmentRepository) listWithProxiesMongo(ctx context.Context) ([]mode
 	}
 	if len(docs) == 0 {
 		return []models.AssignmentWithProxy{}, nil
+	}
+
+	// Dedupe by (machine_id, domain), keeping the most recently used doc.
+	// The Mongo unique index on (machine_id, domain) is not wired up at
+	// startup, so concurrent upserts can race and leave duplicate rows.
+	// Without this pass the dashboard renders two React children with the
+	// same key for the same sticky binding.
+	type dedupeKey struct{ machineID, domain string }
+	dedup := make(map[dedupeKey]assignmentDoc, len(docs))
+	for _, d := range docs {
+		k := dedupeKey{d.MachineID, d.Domain}
+		if prev, ok := dedup[k]; !ok || d.LastUsedAt.After(prev.LastUsedAt) {
+			dedup[k] = d
+		}
+	}
+	docs = docs[:0]
+	for _, d := range dedup {
+		docs = append(docs, d)
 	}
 
 	idSet := make(map[int]struct{}, len(docs))

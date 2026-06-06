@@ -216,27 +216,37 @@ export default function InfrastructurePage() {
   const selectedMachine =
     machines?.find((m) => m.id === selectedMachineId) ?? null
 
-  // When the machine changes, reset/auto-pick the country.
+  // When the machine changes, reset/auto-pick the country. Only consider
+  // groups with traffic in the last 2 minutes — picking a stale country
+  // would leave column 3 showing dead assignments the user can't see in
+  // column 2.
   React.useEffect(() => {
     if (!selectedMachine) {
       setSelectedCountry(null)
       return
     }
-    const groups = selectedMachine.country_groups ?? []
-    if (groups.length === 0) {
+    const liveGroups = (selectedMachine.country_groups ?? []).filter(isCountryLive)
+    if (liveGroups.length === 0) {
       setSelectedCountry(null)
       return
     }
     setSelectedCountry((curr) => {
-      if (curr && groups.some((g) => g.target_country === curr)) return curr
-      return groups[0].target_country
+      if (curr && liveGroups.some((g) => g.target_country === curr)) return curr
+      return liveGroups[0].target_country
     })
   }, [selectedMachine])
 
-  const selectedGroup =
-    selectedMachine?.country_groups?.find(
+  // Only resolve selectedGroup if the chosen country is actually live.
+  // Otherwise column 3 would render stale assignments for a country that
+  // column 2 has already hidden.
+  const selectedGroup = React.useMemo(() => {
+    if (!selectedMachine || !selectedCountry) return null
+    const g = selectedMachine.country_groups?.find(
       (g) => g.target_country === selectedCountry
-    ) ?? null
+    )
+    if (!g || !isCountryLive(g)) return null
+    return g
+  }, [selectedMachine, selectedCountry])
 
   const handleRemoveCountry = React.useCallback(
     async (group: InfrastructureCountryGroup) => {
@@ -849,7 +859,7 @@ function ProxyList({
             <div className="space-y-2 pr-2">
               {activeLane.items.map((a) => (
                 <AssignmentRow
-                  key={`${a.machine_id}-${a.domain}`}
+                  key={`${a.machine_id}-${a.domain}-${a.proxy_id}`}
                   assignment={a}
                 />
               ))}

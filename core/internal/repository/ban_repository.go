@@ -422,6 +422,66 @@ func (r *BanRepository) BannedProxyIDsForDomain(ctx context.Context, machineID, 
 	return out, nil
 }
 
+// AllBannedProxiesByMachineCountry returns every active ban in one
+// round-trip, keyed by [machine_id][country] → set of banned proxy IDs.
+// Replaces N sequential BannedProxiesForCountry calls in the
+// Infrastructure handler, which on Atlas free tier were summing to 60s+
+// and timing out the dashboard.
+func (r *BanRepository) AllBannedProxiesByMachineCountry(ctx context.Context) (map[string]map[string]map[int]bool, error) {
+	out := map[string]map[string]map[int]bool{}
+	add := func(machineID, country string, pid int) {
+		if machineID == "" || country == "" {
+			return
+		}
+		if _, ok := out[machineID]; !ok {
+			out[machineID] = map[string]map[int]bool{}
+		}
+		if _, ok := out[machineID][country]; !ok {
+			out[machineID][country] = map[int]bool{}
+		}
+		out[machineID][country][pid] = true
+	}
+	if r.db.IsMongo() {
+		cur, err := r.db.MongoDB().Collection("proxy_domain_bans").Find(ctx, bson.M{
+			"state": StateBanned,
+		})
+		if err != nil {
+			return nil, err
+		}
+		defer cur.Close(ctx)
+		for cur.Next(ctx) {
+			var d struct {
+				MachineID     string `bson:"machine_id"`
+				TargetCountry string `bson:"target_country"`
+				ProxyID       int    `bson:"proxy_id"`
+			}
+			if err := cur.Decode(&d); err != nil {
+				return nil, err
+			}
+			add(d.MachineID, d.TargetCountry, d.ProxyID)
+		}
+		return out, nil
+	}
+	rows, err := r.db.Pool.Query(ctx, `
+		SELECT machine_id, target_country, proxy_id
+		FROM proxy_domain_bans
+		WHERE state = 'banned' AND target_country <> ''
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var machineID, country string
+		var pid int
+		if err := rows.Scan(&machineID, &country, &pid); err != nil {
+			return nil, err
+		}
+		add(machineID, country, pid)
+	}
+	return out, nil
+}
+
 // BannedProxiesForCountry returns the set of proxies that are banned in at
 // least one domain belonging to the given (machine, country). Used by the
 // dashboard country-rollup count.

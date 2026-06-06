@@ -9,6 +9,7 @@ import (
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/models"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -246,35 +247,49 @@ func (r *DashboardRepository) getStatsMongo(ctx context.Context) (*models.Dashbo
 	var todaySuccess, yesterdaySuccess int
 	var todayRespTotal, yesterdayRespTotal int
 
-	reqCur, err := r.db.MongoDB().Collection("proxy_requests").Find(ctx, bson.M{
-		"timestamp": bson.M{"$gte": yesterdayStart},
-	})
+	// Aggregate server-side: bucket the last 48h into today / yesterday
+	// windows and return one summary row per bucket. Previously this loaded
+	// every row into Go (200k+ rows on Atlas free tier = 60s+).
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{
+			"timestamp": bson.M{"$gte": yesterdayStart},
+		}}},
+		{{Key: "$group", Value: bson.M{
+			"_id": bson.M{"$cond": bson.A{
+				bson.M{"$gte": bson.A{"$timestamp", todayStart}},
+				"today",
+				"yesterday",
+			}},
+			"count":     bson.M{"$sum": 1},
+			"successes": bson.M{"$sum": bson.M{"$cond": bson.A{"$success", 1, 0}}},
+			"resp_sum":  bson.M{"$sum": "$response_time"},
+		}}},
+	}
+	reqCur, err := r.db.MongoDB().Collection("proxy_requests").Aggregate(ctx, pipeline)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load requests: %w", err)
+		return nil, fmt.Errorf("failed to aggregate requests: %w", err)
 	}
 	defer reqCur.Close(ctx)
 
 	for reqCur.Next(ctx) {
-		var req struct {
-			Timestamp    time.Time `bson:"timestamp"`
-			Success      bool      `bson:"success"`
-			ResponseTime int       `bson:"response_time"`
+		var bucket struct {
+			ID        string `bson:"_id"`
+			Count     int    `bson:"count"`
+			Successes int    `bson:"successes"`
+			RespSum   int    `bson:"resp_sum"`
 		}
-		if err := reqCur.Decode(&req); err != nil {
-			return nil, fmt.Errorf("failed to decode request: %w", err)
+		if err := reqCur.Decode(&bucket); err != nil {
+			return nil, fmt.Errorf("failed to decode stats bucket: %w", err)
 		}
-		if req.Timestamp.After(todayStart) || req.Timestamp.Equal(todayStart) {
-			todayCount++
-			todayRespTotal += req.ResponseTime
-			if req.Success {
-				todaySuccess++
-			}
-		} else {
-			yesterdayCount++
-			yesterdayRespTotal += req.ResponseTime
-			if req.Success {
-				yesterdaySuccess++
-			}
+		switch bucket.ID {
+		case "today":
+			todayCount = bucket.Count
+			todaySuccess = bucket.Successes
+			todayRespTotal = bucket.RespSum
+		case "yesterday":
+			yesterdayCount = bucket.Count
+			yesterdaySuccess = bucket.Successes
+			yesterdayRespTotal = bucket.RespSum
 		}
 	}
 

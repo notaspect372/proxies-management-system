@@ -147,6 +147,22 @@ func (h *CheckoutHandler) Infrastructure(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Pull every active ban in a single round-trip. The handler used to call
+	// BannedProxiesForCountry inside the per-bucket loop below, which on Atlas
+	// free tier added one network round-trip per (machine, country) bucket
+	// (~20+ buckets, sequential) and timed out the request.
+	allBans := map[string]map[string]map[int]bool{}
+	if h.bans != nil {
+		if loaded, err := h.bans.AllBannedProxiesByMachineCountry(r.Context()); err != nil {
+			h.logger.Warn("ban prefetch failed; falling back to global status only",
+				"source", "infrastructure",
+				"error", err,
+			)
+		} else {
+			allBans = loaded
+		}
+	}
+
 	// Map machine_id (host or VM) → its parent host id, so a VM's assignments
 	// roll up to the physical machine for the country grouping.
 	parentOf := map[string]string{}
@@ -205,20 +221,14 @@ func (h *CheckoutHandler) Infrastructure(w http.ResponseWriter, r *http.Request)
 			// healthy in any country where it isn't banned.
 			activeCount := len(globallyActive)
 			var bannedInScope map[int]bool
-			if h.bans != nil && k.country != "" && k.country != "Untagged" {
-				banned, err := h.bans.BannedProxiesForCountry(r.Context(), m.ID, k.country)
-				if err != nil {
-					h.logger.Warn("ban lookup failed; falling back to global status only",
-						"source", "infrastructure",
-						"machine_id", m.ID,
-						"country", k.country,
-						"error", err,
-					)
-				} else {
-					bannedInScope = banned
-					for pid := range banned {
-						if globallyActive[pid] {
-							activeCount--
+			if k.country != "" && k.country != "Untagged" {
+				if byCountry, ok := allBans[m.ID]; ok {
+					if banned, ok := byCountry[k.country]; ok {
+						bannedInScope = banned
+						for pid := range banned {
+							if globallyActive[pid] {
+								activeCount--
+							}
 						}
 					}
 				}
