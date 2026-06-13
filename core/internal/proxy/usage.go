@@ -3,16 +3,19 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/repository"
+	"github.com/alpkeskin/rota/core/pkg/logger"
 )
 
 // UsageTracker tracks proxy usage and updates statistics
 type UsageTracker struct {
-	repo   *repository.ProxyRepository
+	repo    *repository.ProxyRepository
 	banRepo *repository.BanRepository
+	log     *logger.Logger
 }
 
 // NewUsageTracker creates a new usage tracker
@@ -26,6 +29,27 @@ func NewUsageTracker(repo *repository.ProxyRepository) *UsageTracker {
 // RecordRequest will update the ban table for any record that carries a
 // non-empty MachineID + TargetCountry.
 func (t *UsageTracker) SetBanRepo(b *repository.BanRepository) { t.banRepo = b }
+
+// SetLogger wires a logger so each recorded request also emits a structured
+// system-level log line (timestamp, proxy ip, url, status, outcome, latency,
+// country, machine, scraper id).
+func (t *UsageTracker) SetLogger(l *logger.Logger) { t.log = l }
+
+// deriveOutcome turns the raw result into a human label for logs/dashboard.
+func deriveOutcome(success bool, statusCode int) string {
+	switch {
+	case statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests:
+		return "Blocked"
+	case statusCode >= 500:
+		return "ServerError"
+	case statusCode == 0 && !success:
+		return "Failed" // transport-level failure, no HTTP response
+	case success:
+		return "Success"
+	default:
+		return "Failed"
+	}
+}
 
 // RequestRecord represents a single proxy request
 type RequestRecord struct {
@@ -47,10 +71,40 @@ type RequestRecord struct {
 	MachineID     string
 	TargetDomain  string
 	TargetCountry string
+	// TargetPort is the port the scraper reached the host on (e.g. "5228" for
+	// mtalk.google.com). Stored on the ban record so the recovery probe tests
+	// the same port instead of assuming 443. Empty means "unknown / default".
+	TargetPort string
+
+	// IsTrial marks this request as an in-band recovery trial: the proxy was a
+	// banned proxy handed back by Checkout because its cooldown elapsed. The
+	// result feeds RecordProbeResult (pass → unban, fail → back off) instead of
+	// the normal success/failure ban accounting.
+	IsTrial bool
+
+	// ScraperID identifies the scraper that issued the request, taken from the
+	// X-Scraper-Id header. Empty when the scraper doesn't send it.
+	ScraperID string
 }
 
 // RecordRequest records a proxy request and updates statistics
 func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) error {
+	// System-level structured log line per request.
+	if t.log != nil {
+		t.log.Info("proxy request",
+			"source", "request_log",
+			"timestamp", record.Timestamp.Format(time.RFC3339),
+			"proxy_ip", record.ProxyAddress,
+			"target_url", record.RequestedURL,
+			"http_status", record.StatusCode,
+			"outcome", deriveOutcome(record.Success, record.StatusCode),
+			"response_time_ms", record.ResponseTime,
+			"country", record.TargetCountry,
+			"machine_id", record.MachineID,
+			"scraper_id", record.ScraperID,
+		)
+	}
+
 	// Insert into proxy_requests hypertable
 	if err := t.insertProxyRequest(ctx, record); err != nil {
 		if shouldIgnoreUsageDBError(err) {
@@ -76,19 +130,69 @@ func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) 
 			MachineID:     record.MachineID,
 			TargetDomain:  record.TargetDomain,
 			TargetCountry: record.TargetCountry,
+			TargetPort:    record.TargetPort,
 		}
-		if record.Success {
+		domain := record.TargetDomain
+		switch {
+		case record.IsTrial:
+			// In-band recovery trial: pass → unban, fail → back off. Trials only
+			// fire for already-banned (hence already-confirmed) scopes.
+			if err := t.banRepo.RecordProbeResult(ctx, scope, record.Success); err != nil && !shouldIgnoreUsageDBError(err) {
+				return fmt.Errorf("ban repo record trial: %w", err)
+			}
+		case isInfraDomain(domain):
+			// Obvious ads/trackers/push infra — never confirm, never account.
+		case record.Success:
+			// A real success proves the domain is a genuine scrape target:
+			// confirm it (permanently, globally) then record the success.
+			if err := t.banRepo.MarkDomainConfirmed(ctx, domain); err != nil && !shouldIgnoreUsageDBError(err) {
+				return fmt.Errorf("ban repo confirm domain: %w", err)
+			}
 			if err := t.banRepo.RecordSuccess(ctx, scope); err != nil && !shouldIgnoreUsageDBError(err) {
 				return fmt.Errorf("ban repo record success: %w", err)
 			}
-		} else {
-			if err := t.banRepo.RecordFailure(ctx, scope); err != nil && !shouldIgnoreUsageDBError(err) {
-				return fmt.Errorf("ban repo record failure: %w", err)
+		default:
+			// Failure: only count it if the domain has been proven real. Junk
+			// and not-yet-confirmed domains are ignored by the ban system.
+			confirmed, err := t.banRepo.IsDomainConfirmed(ctx, domain)
+			if err != nil && !shouldIgnoreUsageDBError(err) {
+				return fmt.Errorf("ban repo is-confirmed: %w", err)
+			}
+			if confirmed {
+				if err := t.banRepo.RecordFailure(ctx, scope); err != nil && !shouldIgnoreUsageDBError(err) {
+					return fmt.Errorf("ban repo record failure: %w", err)
+				}
 			}
 		}
 	}
 
 	return nil
+}
+
+// infraDomainSuffixes is a small static denylist of obvious ad/tracker/push
+// infrastructure. These are skipped before any ban accounting OR confirmation —
+// a browser scraper hits them constantly and they are never scrape targets. The
+// confirmed-domain rule is the primary mechanism; this is just a fast pre-filter.
+var infraDomainSuffixes = []string{
+	"doubleclick.net",
+	"googleadservices.com",
+	"googlesyndication.com",
+	"googletagmanager.com",
+	"google-analytics.com",
+	"gstatic.com",
+	"mtalk.google.com",
+}
+
+// isInfraDomain reports whether the domain is (or is a subdomain of) a known
+// infrastructure domain that should never participate in ban accounting.
+func isInfraDomain(domain string) bool {
+	d := strings.ToLower(domain)
+	for _, s := range infraDomainSuffixes {
+		if d == s || strings.HasSuffix(d, "."+s) {
+			return true
+		}
+	}
+	return false
 }
 
 // insertProxyRequest inserts a record into the proxy_requests hypertable
@@ -112,6 +216,12 @@ func (t *UsageTracker) insertProxyRequest(ctx context.Context, record RequestRec
 			"response_time": record.ResponseTime,
 			"error":         errorMsg,
 			"timestamp":     record.Timestamp,
+			// Enriched system-level log fields.
+			"outcome":     deriveOutcome(record.Success, record.StatusCode),
+			"country":     record.TargetCountry,
+			"machine_id":  record.MachineID,
+			"scraper_id":  record.ScraperID,
+			"target_port": record.TargetPort,
 		})
 	}
 

@@ -71,6 +71,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 
 	// Create usage tracker for health checks
 	tracker := proxy.NewUsageTracker(proxyRepo)
+	tracker.SetLogger(log)
 
 	// Create health checker for testing proxies
 	healthChecker := proxy.NewHealthChecker(proxyRepo, settingsRepo, tracker, log)

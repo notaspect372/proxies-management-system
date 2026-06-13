@@ -6,9 +6,11 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
+	"github.com/jackc/pgx/v5"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -22,6 +24,7 @@ type BanScope struct {
 	MachineID     string
 	TargetDomain  string
 	TargetCountry string // carried for dashboard rollup; not part of identity
+	TargetPort    string // port the scraper reached on (e.g. "5228"); metadata only, not part of identity. Used by the recovery probe.
 }
 
 // State machine values stored in proxy_domain_bans.state.
@@ -44,13 +47,18 @@ const (
 const failureThreshold = 3
 
 // initialCooldown is the wait before the first probe after a fresh ban.
-const initialCooldown = 30 * time.Minute
+// TESTING (temporary): set to 1m for fast recovery testing. Restore to
+// 30 * time.Minute when done.
+const initialCooldown = 1 * time.Minute
 
 // probeBackoffBase doubles per failed probe: 30m, 60m, 120m, 240m, …
-const probeBackoffBase = 30 * time.Minute
+// TESTING (temporary): 1m base. Restore to 30 * time.Minute when done.
+const probeBackoffBase = 1 * time.Minute
 
 // maxCooldown caps backoff so probes still happen at least daily.
-const maxCooldown = 24 * time.Hour
+// TESTING (temporary): capped at 1m so trials repeat every ~1 minute.
+// Restore to 24 * time.Hour when done.
+const maxCooldown = 1 * time.Minute
 
 // historyCap is how many recovery durations we retain per scope for future
 // adaptive learning. Not consumed yet, but written so the data is there.
@@ -61,6 +69,10 @@ const historyCap = 10
 // lifecycle.
 type BanRepository struct {
 	db *database.DB
+	// confirmedCache holds domains proven real (had ≥1 real success). Confirmed
+	// status is permanent, so this cache is write-once-per-domain and never
+	// invalidated. Stores only positives; unconfirmed domains fall through to DB.
+	confirmedCache sync.Map // map[string]struct{}
 }
 
 func NewBanRepository(db *database.DB) *BanRepository {
@@ -99,7 +111,7 @@ func (r *BanRepository) EnsureMongoIndexes(ctx context.Context) error {
 	if !r.db.IsMongo() {
 		return nil
 	}
-	_, err := r.db.MongoDB().Collection("proxy_domain_bans").Indexes().CreateMany(ctx, []mongo.IndexModel{
+	if _, err := r.db.MongoDB().Collection("proxy_domain_bans").Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{
 			Keys: bson.D{
 				{Key: "proxy_id", Value: 1},
@@ -110,8 +122,82 @@ func (r *BanRepository) EnsureMongoIndexes(ctx context.Context) error {
 		},
 		{Keys: bson.D{{Key: "machine_id", Value: 1}, {Key: "target_domain", Value: 1}}},
 		{Keys: bson.D{{Key: "state", Value: 1}, {Key: "next_probe_at", Value: 1}}},
+	}); err != nil {
+		return err
+	}
+
+	// confirmed_domains: unique key on domain.
+	_, err := r.db.MongoDB().Collection("confirmed_domains").Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "domain", Value: 1}},
+		Options: options.Index().SetUnique(true),
 	})
 	return err
+}
+
+// MarkDomainConfirmed records that a domain has produced at least one real
+// success, so it is a genuine scrape target. Idempotent; permanent. Populates
+// the in-memory cache. A domain is confirmed globally (any proxy/machine).
+func (r *BanRepository) MarkDomainConfirmed(ctx context.Context, domain string) error {
+	if domain == "" {
+		return nil
+	}
+	if _, ok := r.confirmedCache.Load(domain); ok {
+		return nil // already known confirmed — DB already has it
+	}
+
+	if r.db.IsMongo() {
+		_, err := r.db.MongoDB().Collection("confirmed_domains").UpdateOne(
+			ctx,
+			bson.M{"domain": domain},
+			bson.M{"$setOnInsert": bson.M{"domain": domain, "first_confirmed_at": time.Now()}},
+			options.Update().SetUpsert(true),
+		)
+		if err != nil {
+			return err
+		}
+	} else {
+		if _, err := r.db.Pool.Exec(ctx,
+			`INSERT INTO confirmed_domains (domain) VALUES ($1) ON CONFLICT (domain) DO NOTHING`,
+			domain,
+		); err != nil {
+			return err
+		}
+	}
+	r.confirmedCache.Store(domain, struct{}{})
+	return nil
+}
+
+// IsDomainConfirmed reports whether a domain has ever produced a real success.
+// Hit on every failed request, so it is cache-first; only confirmed (positive)
+// results are cached. Unconfirmed domains fall through to a point lookup.
+func (r *BanRepository) IsDomainConfirmed(ctx context.Context, domain string) (bool, error) {
+	if domain == "" {
+		return false, nil
+	}
+	if _, ok := r.confirmedCache.Load(domain); ok {
+		return true, nil
+	}
+
+	if r.db.IsMongo() {
+		err := r.db.MongoDB().Collection("confirmed_domains").FindOne(ctx, bson.M{"domain": domain}).Err()
+		if err == mongo.ErrNoDocuments {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	} else {
+		var one int
+		err := r.db.Pool.QueryRow(ctx, `SELECT 1 FROM confirmed_domains WHERE domain = $1`, domain).Scan(&one)
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	r.confirmedCache.Store(domain, struct{}{})
+	return true, nil
 }
 
 // RecordSuccess updates the scope on a successful request: zeros the failure
@@ -149,6 +235,9 @@ func (r *BanRepository) RecordSuccess(ctx context.Context, scope BanScope) error
 			},
 			"$inc":         bson.M{"successful_since_recovery": 1},
 			"$setOnInsert": scope.mongoSetOnInsert(),
+		}
+		if scope.TargetPort != "" {
+			update["$set"].(bson.M)["target_port"] = scope.TargetPort
 		}
 
 		// On a clean recovery (was banned, now succeeding) push the duration
@@ -208,15 +297,19 @@ func (r *BanRepository) RecordFailure(ctx context.Context, scope BanScope) error
 	if r.db.IsMongo() {
 		col := r.db.MongoDB().Collection("proxy_domain_bans")
 		// First: bump the failure counter atomically.
+		failSet := bson.M{
+			"last_failure_at": now,
+			"target_country":  scope.TargetCountry,
+		}
+		if scope.TargetPort != "" {
+			failSet["target_port"] = scope.TargetPort
+		}
 		res := col.FindOneAndUpdate(
 			ctx,
 			scope.mongoFilter(),
 			bson.M{
-				"$inc": bson.M{"failed_count": 1},
-				"$set": bson.M{
-					"last_failure_at": now,
-					"target_country":  scope.TargetCountry,
-				},
+				"$inc":         bson.M{"failed_count": 1},
+				"$set":         failSet,
 				"$setOnInsert": scope.mongoSetOnInsert(),
 			},
 			options.FindOneAndUpdate().
@@ -340,6 +433,74 @@ func (r *BanRepository) RecordProbeResult(ctx context.Context, scope BanScope, p
 		WHERE proxy_id = $1 AND machine_id = $2 AND target_domain = $3
 	`, scope.ProxyID, scope.MachineID, scope.TargetDomain, nextAttempt, now, next)
 	return err
+}
+
+// ClaimTrialProxy atomically claims a banned proxy for (machine, domain) whose
+// cooldown has elapsed, so the next REAL request for this scope can be routed
+// through it as an in-band recovery trial (instead of a synthetic probe). It
+// pushes next_probe_at forward by a hold window so the same proxy isn't claimed
+// again until the trial's result lands (or the hold expires). Returns ok=false
+// when nothing is due. The trial result must be reported via RecordProbeResult.
+func (r *BanRepository) ClaimTrialProxy(ctx context.Context, machineID, domain string) (int, bool, error) {
+	if machineID == "" || domain == "" {
+		return 0, false, nil
+	}
+	now := time.Now()
+	hold := probeBackoffBase // enough time for the trial's result to land
+
+	if r.db.IsMongo() {
+		col := r.db.MongoDB().Collection("proxy_domain_bans")
+		res := col.FindOneAndUpdate(
+			ctx,
+			bson.M{
+				"machine_id":    machineID,
+				"target_domain": domain,
+				"state":         StateBanned,
+				"next_probe_at": bson.M{"$lte": now},
+			},
+			bson.M{"$set": bson.M{"next_probe_at": now.Add(hold), "last_probe_at": now}},
+			options.FindOneAndUpdate().
+				SetSort(bson.D{{Key: "next_probe_at", Value: 1}}).
+				SetReturnDocument(options.Before),
+		)
+		if err := res.Err(); err != nil {
+			if err == mongo.ErrNoDocuments {
+				return 0, false, nil
+			}
+			return 0, false, err
+		}
+		var d struct {
+			ProxyID int `bson:"proxy_id"`
+		}
+		if err := res.Decode(&d); err != nil {
+			return 0, false, err
+		}
+		return d.ProxyID, true, nil
+	}
+
+	// Postgres path: claim the soonest-due banned scope for this (machine,
+	// domain) and hold it forward in one statement.
+	var proxyID int
+	err := r.db.Pool.QueryRow(ctx, `
+		UPDATE proxy_domain_bans
+		SET next_probe_at = $3, last_probe_at = $3
+		WHERE id = (
+			SELECT id FROM proxy_domain_bans
+			WHERE machine_id = $1 AND target_domain = $2
+			  AND state = 'banned' AND next_probe_at <= $4
+			ORDER BY next_probe_at ASC
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING proxy_id
+	`, machineID, domain, now.Add(hold), now).Scan(&proxyID)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return proxyID, true, nil
 }
 
 // IsBanned reports whether this exact (proxy, machine, domain) is in the
@@ -713,6 +874,7 @@ func (r *BanRepository) NextProbeBatch(ctx context.Context, limit int) ([]ProbeT
 			MachineID     string `bson:"machine_id"`
 			TargetDomain  string `bson:"target_domain"`
 			TargetCountry string `bson:"target_country"`
+			TargetPort    string `bson:"target_port"`
 		}
 		var raw []bd
 		if err := cur.All(ctx, &raw); err != nil {
@@ -760,6 +922,7 @@ func (r *BanRepository) NextProbeBatch(ctx context.Context, limit int) ([]ProbeT
 					MachineID:     b.MachineID,
 					TargetDomain:  b.TargetDomain,
 					TargetCountry: b.TargetCountry,
+					TargetPort:    b.TargetPort,
 				},
 				ProxyAddress:  p.Address,
 				ProxyProtocol: p.Protocol,
