@@ -94,3 +94,16 @@ func hostOnly(addr string) string {
 	}
 	return addr
 }
+
+// portOf returns the port component of "host:port", or "" if none is present.
+// Used to remember which port the scraper actually reached so the recovery
+// probe can test that exact port (e.g. mtalk.google.com:5228, not :443).
+func portOf(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	if i := strings.LastIndex(addr, ":"); i != -1 && !strings.Contains(addr[i+1:], "]") {
+		return addr[i+1:]
+	}
+	return ""
+}

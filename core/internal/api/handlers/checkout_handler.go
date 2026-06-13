@@ -61,7 +61,9 @@ func (h *CheckoutHandler) Checkout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxy, sticky, err := h.assignments.Checkout(r.Context(), machineID, domain, country)
+	// allowTrial=false: this bare API hands out a proxy but never observes the
+	// result, so it must not route real traffic through a banned proxy.
+	proxy, sticky, _, err := h.assignments.Checkout(r.Context(), machineID, domain, country, false)
 	if err != nil {
 		if errors.Is(err, repository.ErrNoEligibleProxy) {
 			msg := "no eligible proxy available"

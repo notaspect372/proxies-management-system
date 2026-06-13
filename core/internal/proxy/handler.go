@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +18,16 @@ import (
 	"github.com/google/uuid"
 	proxyDialer "golang.org/x/net/proxy"
 )
+
+// reattachedBody re-emits a buffered prefix followed by the rest of the original
+// response body, and closes the original on Close. Lets us peek at the response
+// for classification without consuming it from the client.
+type reattachedBody struct {
+	io.Reader
+	orig io.ReadCloser
+}
+
+func (b reattachedBody) Close() error { return b.orig.Close() }
 
 // UpstreamProxyHandler handles requests with upstream proxy rotation
 type UpstreamProxyHandler struct {
@@ -54,7 +66,7 @@ func (h *UpstreamProxyHandler) SetAssignmentRepo(repo *repository.AssignmentRepo
 // records the request. Used by the routing path which already picked a proxy
 // via Checkout instead of via the selector. When machineID + targetDomain are
 // non-empty, the result also feeds the per-scope ban tracker.
-func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, machineID, targetCountry string) (net.Conn, error) {
+func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, machineID, targetCountry string, isTrial bool, scraperID string) (net.Conn, error) {
 	startTime := time.Now()
 	conn, err := h.tryConnectWithRetries(p, host, max(h.settings.Retries, 1))
 	duration := int(time.Since(startTime).Milliseconds())
@@ -74,6 +86,9 @@ func (h *UpstreamProxyHandler) ConnectThroughChosenProxy(p *models.Proxy, host, 
 			MachineID:     machineID,
 			TargetDomain:  domain,
 			TargetCountry: targetCountry,
+			TargetPort:    portOf(host),
+			IsTrial:       isTrial,
+			ScraperID:     scraperID,
 		}
 		if success {
 			record.StatusCode = 200
@@ -93,12 +108,26 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// serverRespondedNonHTTP reports whether a request error actually means the
+// upstream origin answered, just not in HTTP — e.g. a host speaking a binary
+// protocol (mtalk.google.com) or returning a malformed reply. The proxy
+// tunnelled the bytes through, so for ban-accounting this is a success, not a
+// proxy failure. A plain connect/timeout/DNS error returns false.
+func serverRespondedNonHTTP(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "malformed http response") ||
+		strings.Contains(msg, "transport connection broken")
+}
+
 // sendViaRoutedProxy honours RoutingHints: pick a proxy via sticky checkout,
 // then send the HTTP request through it with the existing per-proxy retry
 // logic. Mirrors sendWithRetry for the path the routing middleware activates.
-func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context.Context, hints *RoutingHints) (*http.Response, int, error) {
+func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context.Context, hints *RoutingHints) (*http.Response, int, bool, error) {
 	if h.assignments == nil {
-		return nil, 0, fmt.Errorf("routing requested but assignment repository is not configured")
+		return nil, 0, false, fmt.Errorf("routing requested but assignment repository is not configured")
 	}
 
 	host := req.URL.Host
@@ -107,9 +136,9 @@ func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context
 	}
 	domain := hostOnly(host)
 
-	picked, sticky, err := h.assignments.Checkout(ctx, hints.MachineID, domain, hints.Country)
+	picked, sticky, isTrial, err := h.assignments.Checkout(ctx, hints.MachineID, domain, hints.Country, true)
 	if err != nil {
-		return nil, 0, fmt.Errorf("checkout failed: %w", err)
+		return nil, 0, false, fmt.Errorf("checkout failed: %w", err)
 	}
 
 	h.logger.Info("routed HTTP request",
@@ -119,6 +148,7 @@ func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context
 		"domain", domain,
 		"proxy_id", picked.ID,
 		"sticky", sticky,
+		"trial", isTrial,
 	)
 
 	perProxyRetries := h.settings.Retries
@@ -128,9 +158,9 @@ func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context
 
 	resp, err := h.tryProxyWithRetries(req, ctx, picked, perProxyRetries)
 	if err != nil {
-		return nil, picked.ID, err
+		return nil, picked.ID, isTrial, err
 	}
-	return resp, picked.ID, nil
+	return resp, picked.ID, isTrial, nil
 }
 
 // HandleRequest handles HTTP requests with upstream proxy rotation
@@ -153,13 +183,33 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 	// random selector.
 	var resp *http.Response
 	var proxyID int
+	var isTrial bool
 	var err error
 	if hints, ok := ctx.UserData.(*RoutingHints); ok && h.assignments != nil {
-		resp, proxyID, err = h.sendViaRoutedProxy(req, ctx.Req.Context(), hints)
+		resp, proxyID, isTrial, err = h.sendViaRoutedProxy(req, ctx.Req.Context(), hints)
 	} else {
 		resp, proxyID, err = h.sendWithRetry(req, ctx.Req.Context())
 	}
 	duration := int(time.Since(startTime).Milliseconds())
+
+	// Determine REAL success. A clean transport result alone is NOT enough: a
+	// 200-with-captcha / block page is not real data, and treating it as success
+	// would falsely "recover" a banned proxy. Buffer a capped prefix, classify it
+	// with the shared classifier (403/429/anti-bot markers/challenge => fail),
+	// then restore the body so the client still gets the full untouched response.
+	// A non-HTTP reply (e.g. mtalk binary) can't be classified but proves the
+	// proxy reached the origin, so it counts as success.
+	realSuccess := serverRespondedNonHTTP(err)
+	if err == nil && resp != nil {
+		if resp.Body != nil {
+			prefix, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+			orig := resp.Body
+			realSuccess = classifyResponse(resp, prefix).passed
+			resp.Body = reattachedBody{Reader: io.MultiReader(bytes.NewReader(prefix), orig), orig: orig}
+		} else {
+			realSuccess = true // no body (e.g. 204/304) but the origin responded
+		}
+	}
 
 	// Record the request
 	if proxyID > 0 {
@@ -168,7 +218,7 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 			ProxyAddress: "", // Will be filled from proxy info
 			RequestedURL: req.URL.String(),
 			Method:       req.Method,
-			Success:      err == nil && resp != nil,
+			Success:      realSuccess,
 			ResponseTime: duration,
 			Timestamp:    startTime,
 		}
@@ -182,6 +232,9 @@ func (h *UpstreamProxyHandler) HandleRequest(req *http.Request, ctx *goproxy.Pro
 				host = req.Host
 			}
 			record.TargetDomain = hostOnly(host)
+			record.TargetPort = portOf(host)
+			record.IsTrial = isTrial
+			record.ScraperID = req.Header.Get("X-Scraper-Id")
 		}
 
 		if resp != nil {

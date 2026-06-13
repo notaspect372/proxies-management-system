@@ -92,6 +92,7 @@ func New(
 
 	// Create usage tracker
 	tracker := NewUsageTracker(proxyRepo)
+	tracker.SetLogger(log)
 	if banRepo != nil {
 		tracker.SetBanRepo(banRepo)
 		assignmentRepo.SetBanRepo(banRepo)
@@ -127,7 +128,7 @@ func New(
 			if req != nil && req.Context() != nil {
 				ctx = req.Context()
 			}
-			picked, sticky, err := assignmentRepo.Checkout(ctx, hints.MachineID, hostOnly(addr), hints.Country)
+			picked, sticky, isTrial, err := assignmentRepo.Checkout(ctx, hints.MachineID, hostOnly(addr), hints.Country, true)
 			if err != nil {
 				log.Warn("routed CONNECT failed at checkout",
 					"source", "proxy",
@@ -145,8 +146,13 @@ func New(
 				"country", hints.Country,
 				"proxy_id", picked.ID,
 				"sticky", sticky,
+				"trial", isTrial,
 			)
-			return handler.ConnectThroughChosenProxy(picked, addr, hints.MachineID, hints.Country)
+			scraperID := ""
+			if req != nil {
+				scraperID = req.Header.Get("X-Scraper-Id")
+			}
+			return handler.ConnectThroughChosenProxy(picked, addr, hints.MachineID, hints.Country, isTrial, scraperID)
 		}
 
 		// Default path: random rotation, exactly as before.

@@ -82,12 +82,16 @@ func run() error {
 		log.Warn("failed to ensure proxy_domain_bans indexes", "error", err)
 	}
 
-	// Background probe worker — drives the Recovery Test phase of the proxy
-	// lifecycle. Picks up banned scopes whose next_probe_at has fired and
-	// sends a real GET to the domain to decide whether the ban has lifted.
-	probeWorker := proxy.NewProbeWorker(banRepo, log)
-	probeWorker.Start(ctx)
-	defer probeWorker.Stop()
+	// Recovery is now IN-BAND: when a banned scope's cooldown elapses, the next
+	// real scraper request for that (machine, domain) is routed through the
+	// banned proxy as a trial (see AssignmentRepository.Checkout → ClaimTrialProxy).
+	// The trial's real result decides unban/back-off, so the synthetic probe
+	// worker is no longer started. (Kept for reference / manual use.)
+	//
+	// probeWorker := proxy.NewProbeWorker(banRepo, log)
+	// probeWorker.Start(ctx)
+	// defer probeWorker.Stop()
+	_ = banRepo
 
 	// Per-machine routing defaults — when set, scrapers can use plain
 	// `proxy=localhost:8006` and routing kicks in based on this machine's

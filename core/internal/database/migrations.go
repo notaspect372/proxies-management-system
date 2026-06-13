@@ -352,6 +352,19 @@ var migrations = []Migration{
 			WHERE key = 'healthcheck';
 		`,
 	},
+	{
+		Version:     16,
+		Description: "Add confirmed_domains gate for ban accounting",
+		Up: `
+			CREATE TABLE IF NOT EXISTS confirmed_domains (
+				domain TEXT PRIMARY KEY,
+				first_confirmed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+			);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS confirmed_domains;
+		`,
+	},
 }
 
 // Migrate runs all pending migrations

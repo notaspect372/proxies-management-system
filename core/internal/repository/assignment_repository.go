@@ -45,38 +45,57 @@ func (r *AssignmentRepository) SetBanRepo(b *BanRepository) { r.banRepo = b }
 // that country we pick from that subset; if none do, we fall back to the
 // full healthy pool. Either way we record targetCountry on the assignment so
 // the dashboard can group by it.
+// The bool return reports whether the assignment was sticky (reused). isTrial
+// reports that the returned proxy is a BANNED proxy handed back for an in-band
+// recovery trial (cooldown elapsed): the caller must record the result with
+// RequestRecord.IsTrial=true so it flows through RecordProbeResult. allowTrial
+// gates this — only request paths that actually observe the result (the proxy
+// server) should pass true; the bare /checkout API passes false.
 func (r *AssignmentRepository) Checkout(
 	ctx context.Context,
 	machineID, domain, targetCountry string,
-) (*models.Proxy, bool, error) {
+	allowTrial bool,
+) (proxy *models.Proxy, sticky bool, isTrial bool, err error) {
+	// 0. In-band recovery: if a banned proxy for this scope is due for a
+	// trial, route THIS real request through it instead of a healthy proxy.
+	if allowTrial && r.banRepo != nil {
+		if pid, ok, terr := r.banRepo.ClaimTrialProxy(ctx, machineID, domain); terr == nil && ok {
+			if tp, ferr := r.fetchProxyIfHealthy(ctx, pid, ""); ferr == nil && tp != nil {
+				return tp, false, true, nil
+			}
+			// Claimed proxy is gone/globally unhealthy — skip the trial and
+			// fall through to normal selection (the hold already moved it out).
+		}
+	}
+
 	// 1. Look up existing assignment.
 	existingProxyID, hasExisting, err := r.lookupAssignment(ctx, machineID, domain)
 	if err != nil {
-		return nil, false, fmt.Errorf("lookup assignment: %w", err)
+		return nil, false, false, fmt.Errorf("lookup assignment: %w", err)
 	}
 
 	if hasExisting {
 		// Reuse if still healthy. We don't apply the country preference on
 		// reuse — sticky bindings shouldn't flip just because the user
 		// changed the target_country tag.
-		proxy, err := r.fetchProxyIfHealthy(ctx, existingProxyID, "")
-		if err != nil {
-			return nil, false, err
+		existing, ferr := r.fetchProxyIfHealthy(ctx, existingProxyID, "")
+		if ferr != nil {
+			return nil, false, false, ferr
 		}
-		if proxy != nil {
+		if existing != nil {
 			// Per-scope ban check: if this sticky proxy is currently banned
 			// for the requesting (machine, domain), drop the sticky and
 			// pick a fresh one from the eligible pool.
-			banned, err := r.isScopeBanned(ctx, proxy.ID, machineID, domain)
-			if err != nil {
-				return nil, false, err
+			banned, berr := r.isScopeBanned(ctx, existing.ID, machineID, domain)
+			if berr != nil {
+				return nil, false, false, berr
 			}
 			if !banned {
 				if touchErr := r.touchAssignment(ctx, machineID, domain, targetCountry); touchErr != nil {
 					// Non-fatal: stats only.
 					_ = touchErr
 				}
-				return proxy, true, nil
+				return existing, true, false, nil
 			}
 		}
 		// Existing assignment's proxy is gone, unhealthy, or banned for this
@@ -86,34 +105,34 @@ func (r *AssignmentRepository) Checkout(
 	// 2. Try the country-preferred pool first; fall back to any healthy proxy.
 	pool, err := r.eligiblePool(ctx, targetCountry)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if len(pool) == 0 && targetCountry != "" {
 		pool, err = r.eligiblePool(ctx, "")
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
 	// Exclude proxies currently banned for (machine, domain).
 	pool, err = r.filterBanned(ctx, pool, machineID, domain)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if len(pool) == 0 {
-		return nil, false, ErrNoEligibleProxy
+		return nil, false, false, ErrNoEligibleProxy
 	}
 	idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(pool))))
 	if err != nil {
-		return nil, false, fmt.Errorf("rand: %w", err)
+		return nil, false, false, fmt.Errorf("rand: %w", err)
 	}
 	picked := pool[idx.Int64()]
 
 	// 3. Persist the new assignment.
 	if err := r.upsertAssignment(ctx, machineID, domain, picked.ID, targetCountry); err != nil {
-		return nil, false, fmt.Errorf("upsert assignment: %w", err)
+		return nil, false, false, fmt.Errorf("upsert assignment: %w", err)
 	}
 
-	return picked, false, nil
+	return picked, false, false, nil
 }
 
 // isScopeBanned returns true when this proxy is currently banned for the
