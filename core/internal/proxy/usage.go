@@ -140,6 +140,27 @@ func (t *UsageTracker) RecordRequest(ctx context.Context, record RequestRecord) 
 			if err := t.banRepo.RecordProbeResult(ctx, scope, record.Success); err != nil && !shouldIgnoreUsageDBError(err) {
 				return fmt.Errorf("ban repo record trial: %w", err)
 			}
+			// Append to the recovery-trials audit trail so the dashboard can show
+			// that this proxy IP was actually tried and whether it worked. Strictly
+			// best-effort: a write failure here must never fail the request.
+			result := "fail"
+			if record.Success {
+				result = "pass"
+			}
+			if err := t.banRepo.RecordTrialEvent(ctx, repository.TrialEvent{
+				ProxyID:        record.ProxyID,
+				ProxyAddress:   record.ProxyAddress,
+				MachineID:      record.MachineID,
+				TargetDomain:   record.TargetDomain,
+				TargetCountry:  record.TargetCountry,
+				Result:         result,
+				StatusCode:     record.StatusCode,
+				Reason:         record.ErrorMessage,
+				ResponseTimeMs: record.ResponseTime,
+				AttemptedAt:    record.Timestamp,
+			}); err != nil && t.log != nil && !shouldIgnoreUsageDBError(err) {
+				t.log.Warn("failed to record recovery trial event", "scope", scope.String(), "error", err)
+			}
 		case isInfraDomain(domain):
 			// Obvious ads/trackers/push infra — never confirm, never account.
 		case record.Success:

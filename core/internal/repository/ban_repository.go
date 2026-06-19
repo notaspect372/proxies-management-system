@@ -3,9 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,23 +42,67 @@ const (
 	DisplayRecoveryTest = "recovery_test"
 )
 
+// Ban classification values (derived in the API from existing ban fields, not
+// stored). Surfaced by /api/v1/bans so the dashboard can separate stuck/
+// definitive bans from ones still actively being trialed.
+const (
+	ClassPermanent  = "permanent"
+	ClassRecovering = "recovering"
+	ClassCooldown   = "cooldown"
+)
+
+// permanentTrialThreshold is the number of failed recovery trials a scope must
+// have endured before it can be classified permanent. Override via
+// PERMANENT_TRIAL_THRESHOLD.
+func permanentTrialThreshold() int {
+	if raw := os.Getenv("PERMANENT_TRIAL_THRESHOLD"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 5
+}
+
+// permanentMinAge is how long a scope must have been banned before it can be
+// classified permanent. Stops fresh bans from being flagged definitive too
+// early. Override via PERMANENT_MIN_AGE ("24h", "48h", …).
+func permanentMinAge() time.Duration {
+	if raw := os.Getenv("PERMANENT_MIN_AGE"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 24 * time.Hour
+}
+
+// stopProbingPermanent reports whether scopes that turn permanent should have
+// their next_probe_at parked far in the future so they stop being trialed.
+// Default OFF — this feature is opt-in; visibility is the default behaviour.
+func stopProbingPermanent() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("STOP_PROBING_PERMANENT"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// permanentParkDuration is how far out next_probe_at is pushed for a permanent
+// scope when STOP_PROBING_PERMANENT is enabled (~100 years = effectively never).
+const permanentParkDuration = 100 * 365 * 24 * time.Hour
+
 // failureThreshold is the number of consecutive failures within a scope
 // before the proxy is banned for that scope.
 const failureThreshold = 3
 
 // initialCooldown is the wait before the first probe after a fresh ban.
-// TESTING (temporary): set to 1m for fast recovery testing. Restore to
-// 30 * time.Minute when done.
-const initialCooldown = 1 * time.Minute
+const initialCooldown = 60 * time.Minute
 
-// probeBackoffBase doubles per failed probe: 30m, 60m, 120m, 240m, …
-// TESTING (temporary): 1m base. Restore to 30 * time.Minute when done.
-const probeBackoffBase = 1 * time.Minute
+// probeBackoffStep is the linear increment per failed probe. The wait grows
+// 60m, 120m, 180m, 240m, … (step × attempt) — see probeBackoff.
+const probeBackoffStep = 60 * time.Minute
 
 // maxCooldown caps backoff so probes still happen at least daily.
-// TESTING (temporary): capped at 1m so trials repeat every ~1 minute.
-// Restore to 24 * time.Hour when done.
-const maxCooldown = 1 * time.Minute
+const maxCooldown = 24 * time.Hour
 
 // historyCap is how many recovery durations we retain per scope for future
 // adaptive learning. Not consumed yet, but written so the data is there.
@@ -94,12 +138,14 @@ func (r *BanRepository) initialCooldownFor(_ BanScope) time.Duration {
 }
 
 // probeBackoff returns the wait until the next probe given how many probes
-// have already failed for this scope.
+// have already failed for this scope. Linear growth: attempt 1 → 60m,
+// 2 → 120m, 3 → 180m, 4 → 240m, … (probeBackoffStep × attempt), capped at
+// maxCooldown.
 func probeBackoff(failedProbes int) time.Duration {
-	if failedProbes < 0 {
-		failedProbes = 0
+	if failedProbes < 1 {
+		failedProbes = 1
 	}
-	d := time.Duration(math.Pow(2, float64(failedProbes))) * probeBackoffBase
+	d := time.Duration(failedProbes) * probeBackoffStep
 	if d > maxCooldown {
 		d = maxCooldown
 	}
@@ -127,9 +173,18 @@ func (r *BanRepository) EnsureMongoIndexes(ctx context.Context) error {
 	}
 
 	// confirmed_domains: unique key on domain.
-	_, err := r.db.MongoDB().Collection("confirmed_domains").Indexes().CreateOne(ctx, mongo.IndexModel{
+	if _, err := r.db.MongoDB().Collection("confirmed_domains").Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "domain", Value: 1}},
 		Options: options.Index().SetUnique(true),
+	}); err != nil {
+		return err
+	}
+
+	// recovery_trials: per-trial audit history. Queried by domain or by proxy,
+	// always newest-first.
+	_, err := r.db.MongoDB().Collection("recovery_trials").Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "target_domain", Value: 1}, {Key: "attempted_at", Value: -1}}},
+		{Keys: bson.D{{Key: "proxy_id", Value: 1}, {Key: "attempted_at", Value: -1}}},
 	})
 	return err
 }
@@ -397,13 +452,14 @@ func (r *BanRepository) RecordProbeResult(ctx context.Context, scope BanScope, p
 	if r.db.IsMongo() {
 		col := r.db.MongoDB().Collection("proxy_domain_bans")
 		var doc struct {
-			ProbeAttempt int `bson:"probe_attempt"`
+			ProbeAttempt int        `bson:"probe_attempt"`
+			BannedAt     *time.Time `bson:"banned_at"`
 		}
 		if err := col.FindOne(ctx, scope.mongoFilter()).Decode(&doc); err != nil {
 			return err
 		}
 		nextAttempt := doc.ProbeAttempt + 1
-		next := now.Add(probeBackoff(nextAttempt))
+		next := nextProbeAfterFailedTrial(now, nextAttempt, doc.BannedAt)
 		_, err := col.UpdateOne(ctx, scope.mongoFilter(), bson.M{
 			"$set": bson.M{
 				"probe_attempt":   nextAttempt,
@@ -416,14 +472,15 @@ func (r *BanRepository) RecordProbeResult(ctx context.Context, scope BanScope, p
 	}
 
 	var current int
+	var bannedAt *time.Time
 	if err := r.db.Pool.QueryRow(ctx, `
-		SELECT probe_attempt FROM proxy_domain_bans
+		SELECT probe_attempt, banned_at FROM proxy_domain_bans
 		WHERE proxy_id = $1 AND machine_id = $2 AND target_domain = $3
-	`, scope.ProxyID, scope.MachineID, scope.TargetDomain).Scan(&current); err != nil {
+	`, scope.ProxyID, scope.MachineID, scope.TargetDomain).Scan(&current, &bannedAt); err != nil {
 		return err
 	}
 	nextAttempt := current + 1
-	next := now.Add(probeBackoff(nextAttempt))
+	next := nextProbeAfterFailedTrial(now, nextAttempt, bannedAt)
 	_, err := r.db.Pool.Exec(ctx, `
 		UPDATE proxy_domain_bans
 		SET probe_attempt   = $4,
@@ -446,7 +503,7 @@ func (r *BanRepository) ClaimTrialProxy(ctx context.Context, machineID, domain s
 		return 0, false, nil
 	}
 	now := time.Now()
-	hold := probeBackoffBase // enough time for the trial's result to land
+	hold := probeBackoffStep // enough time for the trial's result to land
 
 	if r.db.IsMongo() {
 		col := r.db.MongoDB().Collection("proxy_domain_bans")
@@ -841,6 +898,270 @@ func (r *BanRepository) ListCooldowns(ctx context.Context) ([]CooldownRow, error
 	return out, nil
 }
 
+// BanRow is what the /api/v1/bans endpoint surfaces. It reuses the cooldown
+// row shape and adds a derived classification plus a never-recovered flag.
+type BanRow struct {
+	CooldownRow
+	Classification string `json:"classification"`
+	NeverRecovered bool   `json:"never_recovered"`
+}
+
+// ListBans returns every currently-banned scope (same query as ListCooldowns)
+// enriched with a computed classification (permanent / recovering / cooldown)
+// and a never_recovered flag. When classification is non-empty, only rows with
+// that classification are returned (e.g. "permanent" for the default Ban
+// Analysis view).
+func (r *BanRepository) ListBans(ctx context.Context, classification string) ([]BanRow, error) {
+	base, err := r.ListCooldowns(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make([]BanRow, 0, len(base))
+	for _, c := range base {
+		class, never := classifyBan(c, now)
+		if classification != "" && class != classification {
+			continue
+		}
+		out = append(out, BanRow{
+			CooldownRow:    c,
+			Classification: class,
+			NeverRecovered: never,
+		})
+	}
+	return out, nil
+}
+
+// TrialEvent is one in-band recovery-trial result, written to recovery_trials
+// for the per-scope debug history. Best-effort: a write failure must not fail
+// the originating request.
+type TrialEvent struct {
+	ProxyID        int
+	ProxyAddress   string
+	MachineID      string
+	TargetDomain   string
+	TargetCountry  string
+	Result         string // "pass" | "fail"
+	StatusCode     int    // 0 ⇒ stored NULL
+	Reason         string // "" ⇒ stored NULL
+	ResponseTimeMs int    // <=0 ⇒ stored NULL
+	AttemptedAt    time.Time
+}
+
+// RecordTrialEvent appends one recovery-trial result to the audit trail. The
+// probe_attempt_after value is read back from proxy_domain_bans (best-effort;
+// defaults to 0 if the scope row is gone) so the history shows how many trials
+// the scope had taken at that point.
+func (r *BanRepository) RecordTrialEvent(ctx context.Context, ev TrialEvent) error {
+	scope := BanScope{ProxyID: ev.ProxyID, MachineID: ev.MachineID, TargetDomain: ev.TargetDomain}
+	if !scope.valid() {
+		return nil
+	}
+	if ev.AttemptedAt.IsZero() {
+		ev.AttemptedAt = time.Now()
+	}
+	if ev.Result == "" {
+		ev.Result = "fail"
+	}
+
+	probeAttemptAfter := r.currentProbeAttempt(ctx, scope)
+
+	if r.db.IsMongo() {
+		doc := bson.M{
+			"proxy_id":            ev.ProxyID,
+			"proxy_address":       ev.ProxyAddress,
+			"machine_id":          ev.MachineID,
+			"target_domain":       ev.TargetDomain,
+			"target_country":      ev.TargetCountry,
+			"attempted_at":        ev.AttemptedAt,
+			"result":              ev.Result,
+			"probe_attempt_after": probeAttemptAfter,
+		}
+		if ev.StatusCode > 0 {
+			doc["status_code"] = ev.StatusCode
+		}
+		if ev.Reason != "" {
+			doc["reason"] = ev.Reason
+		}
+		if ev.ResponseTimeMs > 0 {
+			doc["response_time_ms"] = ev.ResponseTimeMs
+		}
+		_, err := r.db.MongoDB().Collection("recovery_trials").InsertOne(ctx, doc)
+		return err
+	}
+
+	_, err := r.db.Pool.Exec(ctx, `
+		INSERT INTO recovery_trials (
+			proxy_id, proxy_address, machine_id, target_domain, target_country,
+			attempted_at, result, status_code, reason, probe_attempt_after, response_time_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`,
+		ev.ProxyID, ev.ProxyAddress, ev.MachineID, ev.TargetDomain, nullableStr(ev.TargetCountry),
+		ev.AttemptedAt, ev.Result, nullableInt(ev.StatusCode), nullableStr(ev.Reason),
+		probeAttemptAfter, nullableInt(ev.ResponseTimeMs),
+	)
+	return err
+}
+
+// currentProbeAttempt reads the scope's probe_attempt (best-effort; 0 on miss).
+func (r *BanRepository) currentProbeAttempt(ctx context.Context, scope BanScope) int {
+	if r.db.IsMongo() {
+		var doc struct {
+			ProbeAttempt int `bson:"probe_attempt"`
+		}
+		if err := r.db.MongoDB().Collection("proxy_domain_bans").
+			FindOne(ctx, scope.mongoFilter()).Decode(&doc); err != nil {
+			return 0
+		}
+		return doc.ProbeAttempt
+	}
+	var n int
+	if err := r.db.Pool.QueryRow(ctx, `
+		SELECT probe_attempt FROM proxy_domain_bans
+		WHERE proxy_id = $1 AND machine_id = $2 AND target_domain = $3
+	`, scope.ProxyID, scope.MachineID, scope.TargetDomain).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// RecoveryTrialFilter narrows a recovery-trials lookup. Empty fields are
+// ignored. Limit defaults to 50 when <= 0.
+type RecoveryTrialFilter struct {
+	ProxyID      int // 0 ⇒ any
+	MachineID    string
+	TargetDomain string
+	Limit        int
+}
+
+// RecoveryTrialRow is one row from the recovery_trials audit trail.
+type RecoveryTrialRow struct {
+	ProxyID           int       `json:"proxy_id"`
+	ProxyAddress      string    `json:"proxy_address"`
+	MachineID         string    `json:"machine_id"`
+	TargetDomain      string    `json:"target_domain"`
+	TargetCountry     string    `json:"target_country,omitempty"`
+	AttemptedAt       time.Time `json:"attempted_at"`
+	Result            string    `json:"result"`
+	StatusCode        *int      `json:"status_code,omitempty"`
+	Reason            *string   `json:"reason,omitempty"`
+	ProbeAttemptAfter int       `json:"probe_attempt_after"`
+	ResponseTimeMs    *int      `json:"response_time_ms,omitempty"`
+}
+
+// ListRecoveryTrials returns recovery-trial history newest-first, optionally
+// filtered by proxy / machine / domain. Powers the dashboard ban detail panel.
+func (r *BanRepository) ListRecoveryTrials(ctx context.Context, f RecoveryTrialFilter) ([]RecoveryTrialRow, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+
+	if r.db.IsMongo() {
+		filter := bson.M{}
+		if f.ProxyID > 0 {
+			filter["proxy_id"] = f.ProxyID
+		}
+		if f.MachineID != "" {
+			filter["machine_id"] = f.MachineID
+		}
+		if f.TargetDomain != "" {
+			filter["target_domain"] = f.TargetDomain
+		}
+		opts := options.Find().
+			SetSort(bson.D{{Key: "attempted_at", Value: -1}}).
+			SetLimit(int64(limit))
+		cur, err := r.db.MongoDB().Collection("recovery_trials").Find(ctx, filter, opts)
+		if err != nil {
+			return nil, err
+		}
+		defer cur.Close(ctx)
+		type doc struct {
+			ProxyID           int       `bson:"proxy_id"`
+			ProxyAddress      string    `bson:"proxy_address"`
+			MachineID         string    `bson:"machine_id"`
+			TargetDomain      string    `bson:"target_domain"`
+			TargetCountry     string    `bson:"target_country"`
+			AttemptedAt       time.Time `bson:"attempted_at"`
+			Result            string    `bson:"result"`
+			StatusCode        *int      `bson:"status_code"`
+			Reason            *string   `bson:"reason"`
+			ProbeAttemptAfter int       `bson:"probe_attempt_after"`
+			ResponseTimeMs    *int      `bson:"response_time_ms"`
+		}
+		var raw []doc
+		if err := cur.All(ctx, &raw); err != nil {
+			return nil, err
+		}
+		out := make([]RecoveryTrialRow, 0, len(raw))
+		for _, d := range raw {
+			out = append(out, RecoveryTrialRow{
+				ProxyID:           d.ProxyID,
+				ProxyAddress:      d.ProxyAddress,
+				MachineID:         d.MachineID,
+				TargetDomain:      d.TargetDomain,
+				TargetCountry:     d.TargetCountry,
+				AttemptedAt:       d.AttemptedAt,
+				Result:            d.Result,
+				StatusCode:        d.StatusCode,
+				Reason:            d.Reason,
+				ProbeAttemptAfter: d.ProbeAttemptAfter,
+				ResponseTimeMs:    d.ResponseTimeMs,
+			})
+		}
+		return out, nil
+	}
+
+	// Postgres path: build a parameterised WHERE from the supplied filters.
+	conds := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	if f.ProxyID > 0 {
+		args = append(args, f.ProxyID)
+		conds = append(conds, fmt.Sprintf("proxy_id = $%d", len(args)))
+	}
+	if f.MachineID != "" {
+		args = append(args, f.MachineID)
+		conds = append(conds, fmt.Sprintf("machine_id = $%d", len(args)))
+	}
+	if f.TargetDomain != "" {
+		args = append(args, f.TargetDomain)
+		conds = append(conds, fmt.Sprintf("target_domain = $%d", len(args)))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit)
+	query := fmt.Sprintf(`
+		SELECT proxy_id, proxy_address, machine_id, target_domain,
+		       COALESCE(target_country, ''), attempted_at, result,
+		       status_code, reason, probe_attempt_after, response_time_ms
+		FROM recovery_trials
+		%s
+		ORDER BY attempted_at DESC
+		LIMIT $%d
+	`, where, len(args))
+
+	rows, err := r.db.Pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]RecoveryTrialRow, 0)
+	for rows.Next() {
+		var row RecoveryTrialRow
+		if err := rows.Scan(
+			&row.ProxyID, &row.ProxyAddress, &row.MachineID, &row.TargetDomain,
+			&row.TargetCountry, &row.AttemptedAt, &row.Result,
+			&row.StatusCode, &row.Reason, &row.ProbeAttemptAfter, &row.ResponseTimeMs,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 // NextProbeBatch returns banned scopes whose next_probe_at has fired. The
 // probe worker calls this in a loop. Joined with proxy info so the worker
 // doesn't need a second round-trip.
@@ -971,6 +1292,50 @@ func displayState(state string, probeAttempt int) string {
 	return DisplayRecoveryTest
 }
 
+// nextProbeAfterFailedTrial returns when the next recovery trial should fire
+// after a failed trial. Normally this is exponential backoff. When
+// STOP_PROBING_PERMANENT is enabled and the scope has crossed into permanent
+// territory (enough failed trials AND old enough), the next probe is parked far
+// in the future so the scope stops being trialed entirely. Default behaviour is
+// unchanged (flag off → always backoff).
+func nextProbeAfterFailedTrial(now time.Time, nextAttempt int, bannedAt *time.Time) time.Time {
+	if stopProbingPermanent() &&
+		nextAttempt >= permanentTrialThreshold() &&
+		bannedAt != nil && now.Sub(*bannedAt) >= permanentMinAge() {
+		return now.Add(permanentParkDuration)
+	}
+	return now.Add(probeBackoff(nextAttempt))
+}
+
+// classifyBan derives a ban's classification (permanent / recovering / cooldown)
+// and whether it has never recovered during the current ban episode, from the
+// existing proxy_domain_bans fields. No new columns — this is computed in the
+// API on read. See ClassPermanent/ClassRecovering/ClassCooldown.
+//
+//   - permanent: banned, has endured >= PERMANENT_TRIAL_THRESHOLD failed trials,
+//     never recovered this episode, and has been banned longer than
+//     PERMANENT_MIN_AGE.
+//   - recovering: banned, has had at least one trial but is not yet permanent.
+//   - cooldown: banned, first trial not done yet (probe_attempt == 0).
+func classifyBan(row CooldownRow, now time.Time) (classification string, neverRecovered bool) {
+	// While a scope is banned a real success would have flipped it back to
+	// active, so successful_since_recovery == 0 means it has not recovered since
+	// the current ban began.
+	neverRecovered = row.SuccessfulSinceRecovery == 0
+
+	if row.State != StateBanned || row.ProbeAttempt == 0 {
+		return ClassCooldown, neverRecovered
+	}
+
+	isPermanent := row.ProbeAttempt >= permanentTrialThreshold() &&
+		neverRecovered &&
+		row.BannedAt != nil && now.Sub(*row.BannedAt) >= permanentMinAge()
+	if isPermanent {
+		return ClassPermanent, neverRecovered
+	}
+	return ClassRecovering, neverRecovered
+}
+
 func (s BanScope) valid() bool {
 	return s.ProxyID > 0 && s.MachineID != "" && s.TargetDomain != ""
 }
@@ -1000,4 +1365,11 @@ func nullableStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+func nullableInt(n int) any {
+	if n <= 0 {
+		return nil
+	}
+	return n
 }

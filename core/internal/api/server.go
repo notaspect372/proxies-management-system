@@ -40,18 +40,20 @@ type Server struct {
 	proxyServer ProxyServer
 
 	// Handlers
-	authHandler          *handlers.AuthHandler
-	healthHandler        *handlers.HealthHandler
-	dashboardHandler     *handlers.DashboardHandler
-	proxyHandler         *handlers.ProxyHandler
-	logsHandler          *handlers.LogsHandler
-	settingsHandler      *handlers.SettingsHandler
-	websocketHandler     *handlers.WebSocketHandler
-	metricsHandler       *handlers.MetricsHandler
-	documentationHandler *handlers.DocumentationHandler
-	checkoutHandler      *handlers.CheckoutHandler
-	cooldownHandler      *handlers.CooldownHandler
-	listenerSyncHandler  *handlers.ListenerSyncHandler
+	authHandler           *handlers.AuthHandler
+	healthHandler         *handlers.HealthHandler
+	dashboardHandler      *handlers.DashboardHandler
+	proxyHandler          *handlers.ProxyHandler
+	logsHandler           *handlers.LogsHandler
+	settingsHandler       *handlers.SettingsHandler
+	websocketHandler      *handlers.WebSocketHandler
+	metricsHandler        *handlers.MetricsHandler
+	documentationHandler  *handlers.DocumentationHandler
+	checkoutHandler       *handlers.CheckoutHandler
+	cooldownHandler       *handlers.CooldownHandler
+	bansHandler           *handlers.BansHandler
+	recoveryTrialsHandler *handlers.RecoveryTrialsHandler
+	listenerSyncHandler   *handlers.ListenerSyncHandler
 }
 
 // New creates a new API server instance
@@ -95,25 +97,29 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	documentationHandler := handlers.NewDocumentationHandler()
 	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, banRepo, log)
 	cooldownHandler := handlers.NewCooldownHandler(banRepo, log)
+	bansHandler := handlers.NewBansHandler(banRepo, log)
+	recoveryTrialsHandler := handlers.NewRecoveryTrialsHandler(banRepo, log)
 	listenerSyncHandler := handlers.NewListenerSyncHandler(services.NewListenerSync(cfg), log)
 
 	s := &Server{
-		router:               chi.NewRouter(),
-		logger:               log,
-		db:                   db,
-		port:                 cfg.APIPort,
-		authHandler:          authHandler,
-		healthHandler:        healthHandler,
-		dashboardHandler:     dashboardHandler,
-		proxyHandler:         proxyHandler,
-		logsHandler:          logsHandler,
-		settingsHandler:      settingsHandler,
-		websocketHandler:     websocketHandler,
-		metricsHandler:       metricsHandler,
-		documentationHandler: documentationHandler,
-		checkoutHandler:      checkoutHandler,
-		cooldownHandler:      cooldownHandler,
-		listenerSyncHandler:  listenerSyncHandler,
+		router:                chi.NewRouter(),
+		logger:                log,
+		db:                    db,
+		port:                  cfg.APIPort,
+		authHandler:           authHandler,
+		healthHandler:         healthHandler,
+		dashboardHandler:      dashboardHandler,
+		proxyHandler:          proxyHandler,
+		logsHandler:           logsHandler,
+		settingsHandler:       settingsHandler,
+		websocketHandler:      websocketHandler,
+		metricsHandler:        metricsHandler,
+		documentationHandler:  documentationHandler,
+		checkoutHandler:       checkoutHandler,
+		cooldownHandler:       cooldownHandler,
+		bansHandler:           bansHandler,
+		recoveryTrialsHandler: recoveryTrialsHandler,
+		listenerSyncHandler:   listenerSyncHandler,
 	}
 
 	s.setupMiddleware()
@@ -196,6 +202,8 @@ func (s *Server) setupRoutes() {
 		r.Delete("/proxy", s.checkoutHandler.Release)
 		r.Get("/infrastructure", s.checkoutHandler.Infrastructure)
 		r.Get("/cooldowns", s.cooldownHandler.List)
+		r.Get("/bans", s.bansHandler.List)
+		r.Get("/recovery-trials", s.recoveryTrialsHandler.List)
 
 		// System logs
 		r.Get("/logs", s.logsHandler.List)

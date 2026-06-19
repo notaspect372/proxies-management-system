@@ -365,6 +365,33 @@ var migrations = []Migration{
 			DROP TABLE IF EXISTS confirmed_domains;
 		`,
 	},
+	{
+		Version:     17,
+		Description: "Add recovery_trials audit trail for in-band recovery trials",
+		Up: `
+			CREATE TABLE IF NOT EXISTS recovery_trials (
+				id BIGSERIAL PRIMARY KEY,
+				proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+				proxy_address VARCHAR(255) NOT NULL,
+				machine_id VARCHAR(120) NOT NULL,
+				target_domain VARCHAR(255) NOT NULL,
+				target_country VARCHAR(80) NULL,
+				attempted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				result TEXT NOT NULL,
+				status_code INTEGER NULL,
+				reason TEXT NULL,
+				probe_attempt_after INTEGER NOT NULL DEFAULT 0,
+				response_time_ms INTEGER NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_recovery_trials_domain
+				ON recovery_trials(target_domain, attempted_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_recovery_trials_proxy
+				ON recovery_trials(proxy_id, attempted_at DESC);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS recovery_trials;
+		`,
+	},
 }
 
 // Migrate runs all pending migrations
