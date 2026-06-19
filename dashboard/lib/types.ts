@@ -271,6 +271,43 @@ export interface CooldownResponse {
   total: number
 }
 
+// Ban Analysis — one row per banned scope, with a classification derived in the
+// API from the existing ban fields (no new column).
+export type BanClassification = "permanent" | "recovering" | "cooldown"
+
+export interface BanRow extends CooldownRow {
+  classification: BanClassification
+  // True when the scope has not had a successful recovery during the current
+  // ban episode (successful_since_recovery == 0).
+  never_recovered: boolean
+}
+
+export interface BansResponse {
+  bans: BanRow[]
+  total: number
+}
+
+// One recovery-trial attempt from the audit trail (recovery_trials). The debug
+// history behind a ban row: which proxy IP was tried and whether it worked.
+export interface RecoveryTrialRow {
+  proxy_id: number
+  proxy_address: string
+  machine_id: string
+  target_domain: string
+  target_country?: string
+  attempted_at: string
+  result: "pass" | "fail"
+  status_code?: number
+  reason?: string
+  probe_attempt_after: number
+  response_time_ms?: number
+}
+
+export interface RecoveryTrialsResponse {
+  trials: RecoveryTrialRow[]
+  total: number
+}
+
 export interface BulkProxyRequest {
   proxies: AddProxyRequest[]
 }

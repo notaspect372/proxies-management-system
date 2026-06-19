@@ -14,6 +14,9 @@ import {
   ProxyTestResult,
   InfrastructureResponse,
   CooldownResponse,
+  BansResponse,
+  BanClassification,
+  RecoveryTrialsResponse,
   ListenerEntry,
   ListenerState,
 } from "./types"
@@ -350,6 +353,31 @@ class ApiClient {
 
   async getCooldowns(): Promise<CooldownResponse> {
     return this.request<CooldownResponse>("/api/v1/cooldowns")
+  }
+
+  async getBans(classification?: BanClassification): Promise<BansResponse> {
+    const query = classification ? `?classification=${classification}` : ""
+    return this.request<BansResponse>(`/api/v1/bans${query}`)
+  }
+
+  async getRecoveryTrials(params?: {
+    proxy_id?: number
+    machine_id?: string
+    target_domain?: string
+    limit?: number
+  }): Promise<RecoveryTrialsResponse> {
+    const searchParams = new URLSearchParams()
+    if (params) {
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== "") {
+          searchParams.append(key, value.toString())
+        }
+      })
+    }
+    const query = searchParams.toString()
+    return this.request<RecoveryTrialsResponse>(
+      `/api/v1/recovery-trials${query ? `?${query}` : ""}`
+    )
   }
 
   async getListeners(): Promise<ListenerState> {

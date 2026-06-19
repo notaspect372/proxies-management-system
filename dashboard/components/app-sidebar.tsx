@@ -13,6 +13,7 @@ import {
   Activity,
   Server,
   Timer,
+  Ban,
   Sheet as SheetIcon,
 } from "lucide-react"
 import { useTheme } from "next-themes"
@@ -56,6 +57,11 @@ const navigation = [
     title: "Cooldown",
     url: "/dashboard/cooldown",
     icon: Timer,
+  },
+  {
+    title: "Ban Analysis",
+    url: "/dashboard/bans",
+    icon: Ban,
   },
   {
     title: "Aux Listeners",
