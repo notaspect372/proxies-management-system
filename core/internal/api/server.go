@@ -51,6 +51,7 @@ type Server struct {
 	documentationHandler *handlers.DocumentationHandler
 	checkoutHandler      *handlers.CheckoutHandler
 	cooldownHandler      *handlers.CooldownHandler
+	listenerSyncHandler  *handlers.ListenerSyncHandler
 }
 
 // New creates a new API server instance
@@ -94,6 +95,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	documentationHandler := handlers.NewDocumentationHandler()
 	checkoutHandler := handlers.NewCheckoutHandler(assignmentRepo, banRepo, log)
 	cooldownHandler := handlers.NewCooldownHandler(banRepo, log)
+	listenerSyncHandler := handlers.NewListenerSyncHandler(services.NewListenerSync(cfg), log)
 
 	s := &Server{
 		router:               chi.NewRouter(),
@@ -111,6 +113,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		documentationHandler: documentationHandler,
 		checkoutHandler:      checkoutHandler,
 		cooldownHandler:      cooldownHandler,
+		listenerSyncHandler:  listenerSyncHandler,
 	}
 
 	s.setupMiddleware()
@@ -202,6 +205,13 @@ func (s *Server) setupRoutes() {
 		r.Get("/settings", s.settingsHandler.Get)
 		r.Put("/settings", s.settingsHandler.Update)
 		r.Post("/settings/reset", s.settingsHandler.Reset)
+
+		// Admin: aux listener CRUD. Rewrites AUX_LISTENERS_SHEET in the .env
+		// file on every mutation. See services.ListenerSync. No auth — relies
+		// on network gating (dashboard only reachable from trusted LAN).
+		r.Get("/admin/listeners", s.listenerSyncHandler.List)
+		r.Post("/admin/listeners", s.listenerSyncHandler.Add)
+		r.Delete("/admin/listeners/{port}", s.listenerSyncHandler.Delete)
 	})
 
 	// WebSocket routes

@@ -14,6 +14,8 @@ import {
   ProxyTestResult,
   InfrastructureResponse,
   CooldownResponse,
+  ListenerEntry,
+  ListenerState,
 } from "./types"
 
 function stripTrailingSlash(url: string): string {
@@ -348,6 +350,23 @@ class ApiClient {
 
   async getCooldowns(): Promise<CooldownResponse> {
     return this.request<CooldownResponse>("/api/v1/cooldowns")
+  }
+
+  async getListeners(): Promise<ListenerState> {
+    return this.request<ListenerState>("/api/v1/admin/listeners")
+  }
+
+  async addListener(entry: ListenerEntry): Promise<ListenerState> {
+    return this.request<ListenerState>("/api/v1/admin/listeners", {
+      method: "POST",
+      body: JSON.stringify(entry),
+    })
+  }
+
+  async deleteListener(port: number): Promise<ListenerState> {
+    return this.request<ListenerState>(`/api/v1/admin/listeners/${port}`, {
+      method: "DELETE",
+    })
   }
 
   async getSettings(): Promise<Settings> {

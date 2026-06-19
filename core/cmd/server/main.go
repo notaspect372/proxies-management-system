@@ -107,10 +107,15 @@ func run() error {
 	// Per-country aux listeners — open one extra port per (machine, country)
 	// pair so scrapers that won't send Proxy-Authorization (Chrome under SB
 	// UC mode) can still hit a country-specific port and have routing
-	// engage. See AUX_LISTENERS in config.
-	if len(cfg.AuxListeners) > 0 {
-		specs := make([]proxy.AuxListenerSpec, 0, len(cfg.AuxListeners))
-		for _, l := range cfg.AuxListeners {
+	// engage. AUX_LISTENERS holds the hand-maintained entries; the dashboard's
+	// "Sync from Sheet" button writes AUX_LISTENERS_SHEET. We concatenate both
+	// so they share one runtime listener set.
+	combinedListeners := make([]config.AuxListenerConfig, 0, len(cfg.AuxListeners)+len(cfg.AuxListenersSheet))
+	combinedListeners = append(combinedListeners, cfg.AuxListeners...)
+	combinedListeners = append(combinedListeners, cfg.AuxListenersSheet...)
+	if len(combinedListeners) > 0 {
+		specs := make([]proxy.AuxListenerSpec, 0, len(combinedListeners))
+		for _, l := range combinedListeners {
 			specs = append(specs, proxy.AuxListenerSpec{
 				MachineID: l.MachineID,
 				Country:   l.Country,

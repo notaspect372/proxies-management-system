@@ -44,11 +44,24 @@ type Config struct {
 	// Entries with no `machine_id/` prefix fall back to RoutingDefaultMachine.
 	AuxListeners []AuxListenerConfig
 
+	// Sheet-managed aux listeners, parsed from `AUX_LISTENERS_SHEET`. Same
+	// format as `AUX_LISTENERS` but rewritten by the dashboard's Aux
+	// Listeners CRUD page. Kept separate so manual entries in
+	// `AUX_LISTENERS` are never overwritten. The startup wiring concatenates
+	// both lists.
+	AuxListenersSheet []AuxListenerConfig
+
 	// Bind address for aux listeners. Defaults to `127.0.0.1` so listeners
 	// are reachable only from the local box. Set to `0.0.0.0` (LAN-wide) or a
 	// specific NIC IP when scrapers run on remote machines. Configured via
 	// `AUX_LISTEN_ADDR`.
 	AuxListenAddr string
+
+	// Absolute path of the .env file the server loaded. Used by the Aux
+	// Listeners page to rewrite `AUX_LISTENERS_SHEET` in place. Empty when
+	// no .env file was found at startup (the mutation endpoints will
+	// refuse to write in that case).
+	EnvFilePath string
 }
 
 // AuxListenerConfig describes one (machine, country)→port aux listener.
@@ -86,7 +99,7 @@ func (d *DatabaseConfig) DSN() string {
 
 // Load reads configuration from environment variables
 func Load() (*Config, error) {
-	loadDotEnv()
+	envPath := loadDotEnv()
 
 	cfg := &Config{
 		ProxyPort: getEnvAsInt("PROXY_PORT", 8000),
@@ -108,7 +121,9 @@ func Load() (*Config, error) {
 		RoutingDefaultMachine: getEnv("ROUTING_DEFAULT_MACHINE", ""),
 		RoutingDefaultCountry: getEnv("ROUTING_DEFAULT_COUNTRY", ""),
 		AuxListeners:          parseAuxListeners(getEnv("AUX_LISTENERS", "")),
+		AuxListenersSheet:     parseAuxListeners(getEnv("AUX_LISTENERS_SHEET", "")),
 		AuxListenAddr:         getEnv("AUX_LISTEN_ADDR", "127.0.0.1"),
+		EnvFilePath:           envPath,
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -154,8 +169,10 @@ func (c *Config) Validate() error {
 // loadDotEnv loads variables from a .env file without overriding any that
 // are already set in the real environment. It searches the current working
 // directory and walks up a few levels so it works whether the binary is run
-// from the repo root or from inside core/.
-func loadDotEnv() {
+// from the repo root or from inside core/. Returns the absolute path of the
+// file actually loaded so the listener-sync feature can rewrite it later;
+// returns "" when no .env was found.
+func loadDotEnv() string {
 	candidates := []string{
 		".env",
 		filepath.Join("core", ".env"),
@@ -166,9 +183,13 @@ func loadDotEnv() {
 	for _, path := range candidates {
 		if _, err := os.Stat(path); err == nil {
 			_ = godotenv.Load(path)
-			return
+			if abs, err := filepath.Abs(path); err == nil {
+				return abs
+			}
+			return path
 		}
 	}
+	return ""
 }
 
 // parseAuxListeners turns a comma-separated list into structured configs.

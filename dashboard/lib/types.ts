@@ -288,3 +288,20 @@ export interface ProxyTestResult {
   tested_at: string
   duration?: number // Alias for response_time for better clarity
 }
+
+// Aux listener CRUD — entries persisted in AUX_LISTENERS_SHEET. Manual
+// entries (AUX_LISTENERS) come back as `manual` so the UI can show them
+// read-only and keep the user from picking a conflicting port.
+
+export interface ListenerEntry {
+  machine_id: string
+  country: string
+  port: number
+}
+
+export interface ListenerState {
+  entries: ListenerEntry[]
+  manual: ListenerEntry[]
+  env_path: string
+  fleet_machines: string[]
+}
