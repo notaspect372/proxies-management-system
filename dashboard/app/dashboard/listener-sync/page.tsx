@@ -20,28 +20,48 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import {
+  AlertTriangle,
+  CheckCircle2,
   Loader2,
   Lock,
   Pencil,
   Pin,
   Plus,
-  RotateCw,
   Shuffle,
   Trash2,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { api } from "@/lib/api"
-import { ListenerEntry, ListenerMode, ListenerState } from "@/lib/types"
+import {
+  ListenerApplyResult,
+  ListenerEntry,
+  ListenerMode,
+  ListenerState,
+} from "@/lib/types"
 
 function modeOf(e: ListenerEntry): ListenerMode {
   return e.mode === "rotate" ? "rotate" : "sticky"
+}
+
+// Turn an apply result into the sentence an operator actually wants: which
+// ports they can connect to now. Returns null when nothing changed.
+function describeApply(r: ListenerApplyResult): string | null {
+  const parts: string[] = []
+  if (r.added?.length) parts.push(`${r.added.join(", ")} now listening`)
+  if (r.rebound?.length) parts.push(`${r.rebound.join(", ")} re-bound`)
+  if (r.removed?.length) parts.push(`${r.removed.join(", ")} closed`)
+  return parts.length ? parts.join(" · ") : null
+}
+
+function failedPorts(r?: ListenerApplyResult): [string, string][] {
+  return r?.failed ? Object.entries(r.failed) : []
 }
 
 export default function ListenerSyncPage() {
   const [state, setState] = React.useState<ListenerState | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
-  const [restartPending, setRestartPending] = React.useState(false)
+  const [applied, setApplied] = React.useState<ListenerApplyResult | null>(null)
   const [deletingPort, setDeletingPort] = React.useState<number | null>(null)
   const [modeChangingPort, setModeChangingPort] = React.useState<number | null>(null)
   const [isAddDialogOpen, setIsAddDialogOpen] = React.useState(false)
@@ -67,8 +87,9 @@ export default function ListenerSyncPage() {
     async (entry: ListenerEntry) => {
       setError(null)
       try {
-        setState(await api.addListener(entry))
-        setRestartPending(true)
+        const next = await api.addListener(entry)
+        setState(next)
+        setApplied(next.applied ?? null)
         setIsAddDialogOpen(false)
       } catch (e) {
         setError(e instanceof Error ? e.message : "Add failed")
@@ -84,8 +105,9 @@ export default function ListenerSyncPage() {
       setDeletingPort(port)
       setError(null)
       try {
-        setState(await api.deleteListener(port))
-        setRestartPending(true)
+        const next = await api.deleteListener(port)
+        setState(next)
+        setApplied(next.applied ?? null)
       } catch (e) {
         setError(e instanceof Error ? e.message : "Delete failed")
       } finally {
@@ -101,8 +123,9 @@ export default function ListenerSyncPage() {
       setModeChangingPort(port)
       setError(null)
       try {
-        setState(await api.setListenerMode(port, next))
-        setRestartPending(true)
+        const updated = await api.setListenerMode(port, next)
+        setState(updated)
+        setApplied(updated.applied ?? null)
       } catch (e) {
         setError(e instanceof Error ? e.message : "Mode change failed")
       } finally {
@@ -116,8 +139,9 @@ export default function ListenerSyncPage() {
     async (originalPort: number, patch: Partial<ListenerEntry>) => {
       setError(null)
       try {
-        setState(await api.updateListener(originalPort, patch))
-        setRestartPending(true)
+        const next = await api.updateListener(originalPort, patch)
+        setState(next)
+        setApplied(next.applied ?? null)
         setEditing(null)
       } catch (e) {
         setError(e instanceof Error ? e.message : "Update failed")
@@ -161,7 +185,7 @@ export default function ListenerSyncPage() {
           Register a (machine, country) → port listener. Saved to{" "}
           <code className="rounded bg-muted px-1 py-0.5 text-xs">AUX_LISTENERS_SHEET</code>{" "}
           in <code className="rounded bg-muted px-1 py-0.5 text-xs">core/.env</code>.
-          Restart the server after any change to bind the new ports.
+          Ports open and close as you save — no restart needed.
         </p>
       </div>
 
@@ -171,16 +195,41 @@ export default function ListenerSyncPage() {
         </div>
       )}
 
-      {restartPending && (
-        <div className="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
-          <RotateCw className="mt-0.5 h-4 w-4 text-amber-600 dark:text-amber-400" />
+      {applied && describeApply(applied) && (
+        <div className="flex items-start gap-3 rounded-lg border border-emerald-500/40 bg-emerald-500/5 p-3 text-sm">
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
           <div>
-            <div className="font-medium text-amber-700 dark:text-amber-300">
-              Restart the server to activate the changes
+            <div className="font-medium text-emerald-700 dark:text-emerald-300">
+              Changes are live
             </div>
             <div className="mt-0.5 text-muted-foreground">
-              Aux listeners only bind their ports at startup. Restart the core
-              process to pick up the new entries.
+              Port {describeApply(applied)}. Other listeners kept their
+              connections.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {failedPorts(applied ?? undefined).length > 0 && (
+        <div className="flex items-start gap-3 rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+          <div className="min-w-0">
+            <div className="font-medium text-amber-700 dark:text-amber-300">
+              Saved, but these ports could not open
+            </div>
+            <div className="mt-0.5 space-y-0.5 text-muted-foreground">
+              {failedPorts(applied ?? undefined).map(([port, reason]) => (
+                <div key={port}>
+                  <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                    {port}
+                  </code>{" "}
+                  — {reason}
+                </div>
+              ))}
+              <div className="pt-1">
+                The entry is saved and will be retried on the next restart. Free
+                the port, then re-save the listener to bind it now.
+              </div>
             </div>
           </div>
         </div>
@@ -380,7 +429,7 @@ function EditListenerDialog({
                 </code>
               </>
             ) : (
-              "Modify machine, country, port, or mode. Restart required for changes to bind."
+              "Modify machine, country, port, or mode. The port re-binds as soon as you save."
             )}
           </DialogDescription>
         </DialogHeader>

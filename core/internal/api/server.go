@@ -55,6 +55,17 @@ type Server struct {
 	recoveryTrialsHandler    *handlers.RecoveryTrialsHandler
 	listenerSyncHandler      *handlers.ListenerSyncHandler
 	recoveryEstimatesHandler *handlers.RecoveryEstimatesHandler
+
+	// listenerSync is kept alongside its handler so the aux listener registry
+	// can be attached after construction — see SetListenerBinder.
+	listenerSync *services.ListenerSync
+}
+
+// SetListenerBinder attaches the live aux listener registry, so registering a
+// port through the dashboard binds it immediately instead of only writing the
+// .env and waiting for someone to restart the service.
+func (s *Server) SetListenerBinder(b services.ListenerBinder) {
+	s.listenerSync.SetBinder(b)
 }
 
 // New creates a new API server instance
@@ -100,7 +111,8 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	cooldownHandler := handlers.NewCooldownHandler(banRepo, log)
 	bansHandler := handlers.NewBansHandler(banRepo, log)
 	recoveryTrialsHandler := handlers.NewRecoveryTrialsHandler(banRepo, log)
-	listenerSyncHandler := handlers.NewListenerSyncHandler(services.NewListenerSync(cfg), log)
+	listenerSync := services.NewListenerSync(cfg)
+	listenerSyncHandler := handlers.NewListenerSyncHandler(listenerSync, log)
 	recoveryEstimatesHandler := handlers.NewRecoveryEstimatesHandler(banRepo, log)
 
 	s := &Server{
@@ -123,6 +135,7 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 		recoveryTrialsHandler:    recoveryTrialsHandler,
 		listenerSyncHandler:      listenerSyncHandler,
 		recoveryEstimatesHandler: recoveryEstimatesHandler,
+		listenerSync:             listenerSync,
 	}
 
 	s.setupMiddleware()

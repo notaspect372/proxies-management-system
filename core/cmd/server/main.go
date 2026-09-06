@@ -36,6 +36,7 @@ import (
 	"github.com/alpkeskin/rota/core/internal/database"
 	"github.com/alpkeskin/rota/core/internal/proxy"
 	"github.com/alpkeskin/rota/core/internal/repository"
+	"github.com/alpkeskin/rota/core/internal/services"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 )
 
@@ -116,20 +117,14 @@ func run() error {
 	combinedListeners := make([]config.AuxListenerConfig, 0, len(cfg.AuxListeners)+len(cfg.AuxListenersSheet))
 	combinedListeners = append(combinedListeners, cfg.AuxListeners...)
 	combinedListeners = append(combinedListeners, cfg.AuxListenersSheet...)
-	if len(combinedListeners) > 0 {
-		specs := make([]proxy.AuxListenerSpec, 0, len(combinedListeners))
-		for _, l := range combinedListeners {
-			specs = append(specs, proxy.AuxListenerSpec{
-				MachineID: l.MachineID,
-				Country:   l.Country,
-				Port:      l.Port,
-				Mode:      l.Mode,
-			})
-		}
-		if err := proxy.StartAuxListeners(cfg.RoutingDefaultMachine, cfg.AuxListenAddr, cfg.ProxyPort, specs, log); err != nil {
-			return fmt.Errorf("failed to start aux listeners: %w", err)
-		}
+	auxRegistry, err := proxy.StartAuxListeners(
+		cfg.RoutingDefaultMachine, cfg.AuxListenAddr, cfg.ProxyPort,
+		auxSpecs(combinedListeners), log,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to start aux listeners: %w", err)
 	}
+	defer auxRegistry.Close()
 
 	// Create servers
 	proxyServer, err := proxy.New(cfg.ProxyPort, log, proxyRepo, settingsRepo, assignmentRepo, banRepo)
@@ -140,6 +135,10 @@ func run() error {
 
 	// Set proxy server reference in API server for reload functionality
 	apiServer.SetProxyServer(proxyServer)
+
+	// Let the dashboard's Aux Listeners page bind and unbind ports on the
+	// running process, so registering one no longer needs a manual restart.
+	apiServer.SetListenerBinder(auxBinder{reg: auxRegistry})
 
 	// Start servers in goroutines
 	errChan := make(chan error, 2)
@@ -214,4 +213,35 @@ func run() error {
 	log.Info("shutdown completed successfully")
 	return nil
 }
+
+// auxSpecs converts the config shape into the proxy package's listener spec.
+func auxSpecs(in []config.AuxListenerConfig) []proxy.AuxListenerSpec {
+	out := make([]proxy.AuxListenerSpec, 0, len(in))
+	for _, l := range in {
+		out = append(out, proxy.AuxListenerSpec{
+			MachineID: l.MachineID,
+			Country:   l.Country,
+			Port:      l.Port,
+			Mode:      l.Mode,
+		})
+	}
+	return out
+}
+
+// auxBinder adapts the proxy package's aux registry to the interface the
+// listener-sync service expects. The adapter lives here so neither package has
+// to import the other.
+type auxBinder struct{ reg *proxy.AuxRegistry }
+
+func (b auxBinder) Apply(specs []config.AuxListenerConfig) services.ApplyResult {
+	d := b.reg.Apply(auxSpecs(specs))
+	return services.ApplyResult{
+		Added:   d.Added,
+		Removed: d.Removed,
+		Rebound: d.Rebound,
+		Failed:  d.Failed,
+	}
+}
+
+func (b auxBinder) ActivePorts() []int { return b.reg.ActivePorts() }
 

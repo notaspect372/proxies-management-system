@@ -49,20 +49,64 @@ func (e ListenerEntry) String() string {
 	return base
 }
 
+// ApplyResult reports what a mutation did to the live listener sockets.
+// Ports in Failed kept their .env entry but could not be bound — almost
+// always because another process holds the port.
+type ApplyResult struct {
+	Added   []int          `json:"added"`
+	Removed []int          `json:"removed"`
+	Rebound []int          `json:"rebound"`
+	Failed  map[int]string `json:"failed,omitempty"`
+}
+
+// ListenerBinder applies a desired listener set to the running process.
+// Implemented by the proxy package's aux registry and injected at startup, so
+// this package stays free of any socket handling.
+type ListenerBinder interface {
+	Apply(specs []config.AuxListenerConfig) ApplyResult
+	ActivePorts() []int
+}
+
 // ListenerSync owns the read/write pipeline for the sheet-managed listener
-// list. It holds a reference to *Config because we mutate
-// AuxListenersSheet in-place after a successful write so the dashboard
-// reflects the new state without waiting for a restart (the actual aux
-// listeners still need a restart to bind new ports — that's the restart
-// banner in the UI).
+// list. It holds a reference to *Config because we mutate AuxListenersSheet
+// in-place after a successful write, and a ListenerBinder so the change also
+// reaches the running sockets.
+//
+// Registering a port used to be a two-step affair: the UI wrote the .env, then
+// a human restarted the service so the port would bind. The binder closes that
+// gap — one port opens or closes on its own and every other listener keeps its
+// connections. When no binder is wired (tests, or a build that doesn't run the
+// proxy) writes still work and simply don't take effect until the next start.
 type ListenerSync struct {
-	cfg *config.Config
-	mu  sync.Mutex // serialises Add/Delete so concurrent writes can't lose entries
+	cfg    *config.Config
+	binder ListenerBinder
+	mu     sync.Mutex // serialises Add/Delete so concurrent writes can't lose entries
 }
 
 // NewListenerSync wires the service against the live config pointer.
 func NewListenerSync(cfg *config.Config) *ListenerSync {
 	return &ListenerSync{cfg: cfg}
+}
+
+// SetBinder attaches the live socket registry. Called once at startup.
+func (s *ListenerSync) SetBinder(b ListenerBinder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.binder = b
+}
+
+// applyLive pushes the current desired set (manual + managed, exactly what a
+// restart would bind) at the running listeners and returns what changed.
+// Callers must hold s.mu. Returns nil when no binder is attached.
+func (s *ListenerSync) applyLive() *ApplyResult {
+	if s.binder == nil {
+		return nil
+	}
+	desired := make([]config.AuxListenerConfig, 0, len(s.cfg.AuxListeners)+len(s.cfg.AuxListenersSheet))
+	desired = append(desired, s.cfg.AuxListeners...)
+	desired = append(desired, s.cfg.AuxListenersSheet...)
+	res := s.binder.Apply(desired)
+	return &res
 }
 
 // ErrPortInUse means the requested port is already claimed by another
@@ -93,6 +137,15 @@ type State struct {
 	Manual        []ListenerEntry `json:"manual"`
 	EnvPath       string          `json:"env_path"`
 	FleetMachines []string        `json:"fleet_machines"`
+
+	// ActivePorts is what is bound right now, which is the honest answer to
+	// "can I connect to this?" — the entry list only says what was configured.
+	// The two diverge when a port is held by another process.
+	ActivePorts []int `json:"active_ports"`
+
+	// Applied is set on the responses to Add/Update/Delete and describes what
+	// the mutation did to the live sockets. Absent on plain List.
+	Applied *ApplyResult `json:"applied,omitempty"`
 }
 
 // List returns the current managed entries (sorted by port), the read-only
@@ -140,7 +193,7 @@ func (s *ListenerSync) Add(in ListenerEntry) (State, error) {
 	if err := s.persistManaged(entries); err != nil {
 		return s.snapshot(), err
 	}
-	return s.snapshot(), nil
+	return s.applied(), nil
 }
 
 // ListenerPatch is the wire shape for partial listener updates. Every field
@@ -242,7 +295,7 @@ func (s *ListenerSync) Update(port int, patch ListenerPatch) (State, error) {
 			return s.snapshot(), err
 		}
 	}
-	return s.snapshot(), nil
+	return s.applied(), nil
 }
 
 // findPortIndex returns the index of the entry on `port` in `in`, or -1.
@@ -268,13 +321,13 @@ func (s *ListenerSync) Delete(port int) (State, error) {
 		if err := s.persistManaged(configToEntries(next)); err != nil {
 			return s.snapshot(), err
 		}
-		return s.snapshot(), nil
+		return s.applied(), nil
 	}
 	if next, removed := withoutPort(s.cfg.AuxListeners, port); removed {
 		if err := s.persistManual(configToEntries(next)); err != nil {
 			return s.snapshot(), err
 		}
-		return s.snapshot(), nil
+		return s.applied(), nil
 	}
 	return s.snapshot(), nil
 }
@@ -300,12 +353,26 @@ func withoutPort(in []config.AuxListenerConfig, port int) ([]config.AuxListenerC
 
 // snapshot builds a State from the current cfg. Callers must hold s.mu.
 func (s *ListenerSync) snapshot() State {
-	return State{
+	st := State{
 		Entries:       cloneEntries(s.cfg.AuxListenersSheet),
 		Manual:        cloneEntries(s.cfg.AuxListeners),
 		EnvPath:       s.cfg.EnvFilePath,
 		FleetMachines: models.FleetMachineIDs(),
 	}
+	if s.binder != nil {
+		st.ActivePorts = s.binder.ActivePorts()
+	}
+	return st
+}
+
+// applied runs the reconcile and returns the snapshot carrying its result.
+// Every successful mutation ends with this so the caller learns which ports
+// are live, not merely which ones were written. Callers must hold s.mu.
+func (s *ListenerSync) applied() State {
+	res := s.applyLive()
+	st := s.snapshot()
+	st.Applied = res
+	return st
 }
 
 // portOwner reports which existing listener claims port p, or "" if free.

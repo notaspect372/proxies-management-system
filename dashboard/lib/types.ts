@@ -341,11 +341,27 @@ export interface ListenerEntry {
   mode?: ListenerMode | ""
 }
 
+/** What a listener mutation did to the live sockets. Ports under `failed`
+ *  were saved to the .env but could not be bound — almost always because
+ *  another process already holds the port. */
+export interface ListenerApplyResult {
+  added: number[]
+  removed: number[]
+  /** Stayed open but now carries different routing credentials. */
+  rebound: number[]
+  failed?: Record<string, string>
+}
+
 export interface ListenerState {
   entries: ListenerEntry[]
   manual: ListenerEntry[]
   env_path: string
   fleet_machines: string[]
+  /** Ports actually bound right now, which is what a scraper can connect to.
+   *  Diverges from `entries` when a port failed to bind. */
+  active_ports: number[]
+  /** Present only on the response to a mutation. */
+  applied?: ListenerApplyResult
 }
 
 // Learned per-site cooldown profile. Built from recovery_events — one row per
