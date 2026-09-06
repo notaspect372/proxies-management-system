@@ -25,7 +25,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Loader2, Timer, RefreshCw } from "lucide-react"
+import { Loader2, Timer, RefreshCw, Trash2 } from "lucide-react"
 import { api } from "@/lib/api"
 import { CooldownRow } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -71,6 +71,8 @@ export default function CooldownPage() {
   const [rows, setRows] = React.useState<CooldownRow[] | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [refreshing, setRefreshing] = React.useState(false)
+  const [clearing, setClearing] = React.useState(false)
+  const [cleared, setCleared] = React.useState<number | null>(null)
 
   const [search, setSearch] = React.useState("")
   const [machineFilter, setMachineFilter] = React.useState<string>("all")
@@ -88,6 +90,35 @@ export default function CooldownPage() {
       setRefreshing(false)
     }
   }, [])
+
+  // Wipes every banned scope. Destructive and irreversible — the bans and
+  // their failure streaks are gone, so affected proxies go straight back into
+  // rotation for the sites they were banned on.
+  const handleClearAll = React.useCallback(async () => {
+    const total = rows?.length ?? 0
+    if (total === 0) return
+    if (
+      !window.confirm(
+        `Clear all ${total} cooldown${total === 1 ? "" : "s"}?\n\n` +
+          "Every banned proxy/site pair returns to rotation immediately and " +
+          "its failure history is discarded. This cannot be undone."
+      )
+    ) {
+      return
+    }
+
+    setClearing(true)
+    setError(null)
+    try {
+      const res = await api.clearCooldowns()
+      setCleared(res.cleared)
+      await load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to clear cooldowns")
+    } finally {
+      setClearing(false)
+    }
+  }, [rows, load])
 
   React.useEffect(() => {
     void load()
@@ -133,22 +164,52 @@ export default function CooldownPage() {
             request to the site succeeds, the proxy returns to Active for that site.
           </p>
         </div>
-        <button
-          onClick={() => void load()}
-          disabled={refreshing}
-          className={cn(
-            "inline-flex items-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent",
-            refreshing && "opacity-60"
-          )}
-        >
-          {refreshing ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <RefreshCw className="h-4 w-4" />
-          )}
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => void load()}
+            disabled={refreshing}
+            className={cn(
+              "inline-flex items-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent",
+              refreshing && "opacity-60"
+            )}
+          >
+            {refreshing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+            Refresh
+          </button>
+          <button
+            onClick={() => void handleClearAll()}
+            disabled={clearing || !rows || rows.length === 0}
+            title={
+              rows && rows.length === 0
+                ? "Nothing to clear"
+                : "Delete every cooldown and return those proxies to rotation"
+            }
+            className={cn(
+              "inline-flex items-center gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-600 transition-colors hover:bg-red-500/20 dark:text-red-400",
+              (clearing || !rows || rows.length === 0) &&
+                "pointer-events-none opacity-50"
+            )}
+          >
+            {clearing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Trash2 className="h-4 w-4" />
+            )}
+            Clear All
+          </button>
+        </div>
       </div>
+
+      {cleared !== null && (
+        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400">
+          Cleared {cleared} cooldown{cleared === 1 ? "" : "s"}. Those proxies are
+          back in rotation.
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
         <Card>

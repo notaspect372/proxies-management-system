@@ -40,20 +40,21 @@ type Server struct {
 	proxyServer ProxyServer
 
 	// Handlers
-	authHandler           *handlers.AuthHandler
-	healthHandler         *handlers.HealthHandler
-	dashboardHandler      *handlers.DashboardHandler
-	proxyHandler          *handlers.ProxyHandler
-	logsHandler           *handlers.LogsHandler
-	settingsHandler       *handlers.SettingsHandler
-	websocketHandler      *handlers.WebSocketHandler
-	metricsHandler        *handlers.MetricsHandler
-	documentationHandler  *handlers.DocumentationHandler
-	checkoutHandler       *handlers.CheckoutHandler
-	cooldownHandler       *handlers.CooldownHandler
-	bansHandler           *handlers.BansHandler
-	recoveryTrialsHandler *handlers.RecoveryTrialsHandler
-	listenerSyncHandler   *handlers.ListenerSyncHandler
+	authHandler              *handlers.AuthHandler
+	healthHandler            *handlers.HealthHandler
+	dashboardHandler         *handlers.DashboardHandler
+	proxyHandler             *handlers.ProxyHandler
+	logsHandler              *handlers.LogsHandler
+	settingsHandler          *handlers.SettingsHandler
+	websocketHandler         *handlers.WebSocketHandler
+	metricsHandler           *handlers.MetricsHandler
+	documentationHandler     *handlers.DocumentationHandler
+	checkoutHandler          *handlers.CheckoutHandler
+	cooldownHandler          *handlers.CooldownHandler
+	bansHandler              *handlers.BansHandler
+	recoveryTrialsHandler    *handlers.RecoveryTrialsHandler
+	listenerSyncHandler      *handlers.ListenerSyncHandler
+	recoveryEstimatesHandler *handlers.RecoveryEstimatesHandler
 }
 
 // New creates a new API server instance
@@ -100,26 +101,28 @@ func New(cfg *config.Config, log *logger.Logger, db *database.DB) *Server {
 	bansHandler := handlers.NewBansHandler(banRepo, log)
 	recoveryTrialsHandler := handlers.NewRecoveryTrialsHandler(banRepo, log)
 	listenerSyncHandler := handlers.NewListenerSyncHandler(services.NewListenerSync(cfg), log)
+	recoveryEstimatesHandler := handlers.NewRecoveryEstimatesHandler(banRepo, log)
 
 	s := &Server{
-		router:                chi.NewRouter(),
-		logger:                log,
-		db:                    db,
-		port:                  cfg.APIPort,
-		authHandler:           authHandler,
-		healthHandler:         healthHandler,
-		dashboardHandler:      dashboardHandler,
-		proxyHandler:          proxyHandler,
-		logsHandler:           logsHandler,
-		settingsHandler:       settingsHandler,
-		websocketHandler:      websocketHandler,
-		metricsHandler:        metricsHandler,
-		documentationHandler:  documentationHandler,
-		checkoutHandler:       checkoutHandler,
-		cooldownHandler:       cooldownHandler,
-		bansHandler:           bansHandler,
-		recoveryTrialsHandler: recoveryTrialsHandler,
-		listenerSyncHandler:   listenerSyncHandler,
+		router:                   chi.NewRouter(),
+		logger:                   log,
+		db:                       db,
+		port:                     cfg.APIPort,
+		authHandler:              authHandler,
+		healthHandler:            healthHandler,
+		dashboardHandler:         dashboardHandler,
+		proxyHandler:             proxyHandler,
+		logsHandler:              logsHandler,
+		settingsHandler:          settingsHandler,
+		websocketHandler:         websocketHandler,
+		metricsHandler:           metricsHandler,
+		documentationHandler:     documentationHandler,
+		checkoutHandler:          checkoutHandler,
+		cooldownHandler:          cooldownHandler,
+		bansHandler:              bansHandler,
+		recoveryTrialsHandler:    recoveryTrialsHandler,
+		listenerSyncHandler:      listenerSyncHandler,
+		recoveryEstimatesHandler: recoveryEstimatesHandler,
 	}
 
 	s.setupMiddleware()
@@ -144,7 +147,7 @@ func (s *Server) setupMiddleware() {
 	// CORS middleware
 	s.router.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},
 		AllowCredentials: true,
@@ -202,8 +205,14 @@ func (s *Server) setupRoutes() {
 		r.Delete("/proxy", s.checkoutHandler.Release)
 		r.Get("/infrastructure", s.checkoutHandler.Infrastructure)
 		r.Get("/cooldowns", s.cooldownHandler.List)
+		r.Delete("/cooldowns", s.cooldownHandler.ClearAll)
 		r.Get("/bans", s.bansHandler.List)
 		r.Get("/recovery-trials", s.recoveryTrialsHandler.List)
+
+		// Learned per-site cooldown profile + the observations behind each
+		// estimate. See repository/recovery_estimates.go.
+		r.Get("/recovery-estimates", s.recoveryEstimatesHandler.List)
+		r.Get("/recovery-estimates/{domain}", s.recoveryEstimatesHandler.Detail)
 
 		// System logs
 		r.Get("/logs", s.logsHandler.List)
@@ -219,6 +228,7 @@ func (s *Server) setupRoutes() {
 		// on network gating (dashboard only reachable from trusted LAN).
 		r.Get("/admin/listeners", s.listenerSyncHandler.List)
 		r.Post("/admin/listeners", s.listenerSyncHandler.Add)
+		r.Patch("/admin/listeners/{port}", s.listenerSyncHandler.Update)
 		r.Delete("/admin/listeners/{port}", s.listenerSyncHandler.Delete)
 	})
 
@@ -250,6 +260,7 @@ func (s *Server) SetProxyServer(ps ProxyServer) {
 }
 
 // ReloadProxyPool reloads the proxy pool from database
+//
 //	@Summary		Reload proxy pool
 //	@Description	Reload proxy pool from database
 //	@Tags			proxies

@@ -70,6 +70,11 @@ type AuxListenerConfig struct {
 	MachineID string
 	Country   string
 	Port      int
+	// Mode is either "sticky" (default — same proxy per (machine, domain))
+	// or "rotate" (random proxy per request, avoiding the immediately
+	// preceding one). Persisted as an optional 3rd colon field in the env
+	// entry: `machine/country:port:rotate`. Absent → sticky.
+	Mode string
 }
 
 // DatabaseConfig holds database configuration
@@ -193,10 +198,13 @@ func loadDotEnv() string {
 }
 
 // parseAuxListeners turns a comma-separated list into structured configs.
-// Each entry has the form `[machine_id/]country:port`. The machine_id prefix
-// is optional — when omitted, the listener falls back to RoutingDefaultMachine
-// at startup. Whitespace around fields is trimmed; bad entries are skipped
-// with a stderr warning so a typo in one entry doesn't kill startup.
+// Each entry has the form `[machine_id/]country:port[:mode]`. The machine_id
+// prefix is optional — when omitted, the listener falls back to
+// RoutingDefaultMachine at startup. `mode` is an optional 3rd field, either
+// `rotate` (random proxy per request, avoid consecutive repeat) or `sticky`
+// (default; same proxy per (machine, domain)). Whitespace around fields is
+// trimmed; bad entries are skipped with a stderr warning so a typo in one
+// entry doesn't kill startup.
 func parseAuxListeners(raw string) []AuxListenerConfig {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -208,17 +216,19 @@ func parseAuxListeners(raw string) []AuxListenerConfig {
 		if entry == "" {
 			continue
 		}
-		i := strings.LastIndex(entry, ":")
-		if i <= 0 || i == len(entry)-1 {
-			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping malformed entry %q (want [machine_id/]country:port)\n", entry)
+		// Split into up to 3 colon-separated fields: left / port / mode.
+		// The left side may itself contain a slash for machine_id/country.
+		fields := strings.Split(entry, ":")
+		if len(fields) < 2 || len(fields) > 3 {
+			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping malformed entry %q (want [machine_id/]country:port[:mode])\n", entry)
 			continue
 		}
-		port, err := strconv.Atoi(strings.TrimSpace(entry[i+1:]))
+		port, err := strconv.Atoi(strings.TrimSpace(fields[1]))
 		if err != nil || port < 1 || port > 65535 {
 			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping %q — bad port\n", entry)
 			continue
 		}
-		left := strings.TrimSpace(entry[:i])
+		left := strings.TrimSpace(fields[0])
 		machineID := ""
 		country := left
 		if slash := strings.Index(left, "/"); slash >= 0 {
@@ -229,7 +239,20 @@ func parseAuxListeners(raw string) []AuxListenerConfig {
 			fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping %q — empty country\n", entry)
 			continue
 		}
-		out = append(out, AuxListenerConfig{MachineID: machineID, Country: country, Port: port})
+		mode := ""
+		if len(fields) == 3 {
+			raw := strings.ToLower(strings.TrimSpace(fields[2]))
+			switch raw {
+			case "", "sticky":
+				mode = ""
+			case "rotate":
+				mode = "rotate"
+			default:
+				fmt.Fprintf(os.Stderr, "AUX_LISTENERS: skipping %q — mode must be sticky or rotate\n", entry)
+				continue
+			}
+		}
+		out = append(out, AuxListenerConfig{MachineID: machineID, Country: country, Port: port, Mode: mode})
 	}
 	return out
 }

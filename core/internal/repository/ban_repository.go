@@ -94,18 +94,27 @@ const permanentParkDuration = 100 * 365 * 24 * time.Hour
 // before the proxy is banned for that scope.
 const failureThreshold = 3
 
-// initialCooldown is the wait before the first probe after a fresh ban.
-const initialCooldown = 60 * time.Minute
+// initialCooldown is the wait before the first trial after a fresh ban.
+const initialCooldown = 30 * time.Minute
 
-// probeBackoffStep is the linear increment per failed probe. The wait grows
-// 60m, 120m, 180m, 240m, … (step × attempt) — see probeBackoff.
-const probeBackoffStep = 60 * time.Minute
+// probeBackoffBase is the unit the doubling schedule is built from. Each
+// failed trial doubles the wait: 30m → 60m → 120m → 240m → … (base × 2^n),
+// capped at maxCooldown. See probeBackoff.
+const probeBackoffBase = 30 * time.Minute
 
-// maxCooldown caps backoff so probes still happen at least daily.
+// maxCooldown caps backoff so trials still happen at least daily.
 const maxCooldown = 24 * time.Hour
 
-// historyCap is how many recovery durations we retain per scope for future
-// adaptive learning. Not consumed yet, but written so the data is there.
+// trialHoldWindow is how far ClaimTrialProxy pushes next_probe_at when it hands
+// a banned proxy to a real request as a trial. It only has to outlast the round
+// trip of that one request — long enough for the result to land and rewrite the
+// schedule properly, short enough that a request which never reports back does
+// not strand the scope for a whole day.
+const trialHoldWindow = 60 * time.Minute
+
+// historyCap is how many recovery durations we retain per scope on the ban
+// document itself. The cross-scope learning set lives in recovery_events —
+// see recordRecoveryEvent / ListDomainRecoveryEstimates.
 const historyCap = 10
 
 // BanRepository owns the proxy_domain_bans collection: per-scope state
@@ -137,15 +146,21 @@ func (r *BanRepository) initialCooldownFor(_ BanScope) time.Duration {
 	return initialCooldown
 }
 
-// probeBackoff returns the wait until the next probe given how many probes
-// have already failed for this scope. Linear growth: attempt 1 → 60m,
-// 2 → 120m, 3 → 180m, 4 → 240m, … (probeBackoffStep × attempt), capped at
-// maxCooldown.
+// probeBackoff returns the wait until the next trial given how many trials
+// have already failed for this scope. The wait doubles each time:
+// 1 → 60m, 2 → 120m, 3 → 240m, 4 → 480m, … (probeBackoffBase × 2^n), capped
+// at maxCooldown. Combined with initialCooldown the full ladder a scope walks
+// is 30m (first trial), then 60m, 120m, 240m, … after each failure.
 func probeBackoff(failedProbes int) time.Duration {
 	if failedProbes < 1 {
 		failedProbes = 1
 	}
-	d := time.Duration(failedProbes) * probeBackoffStep
+	// Guard the shift: anything past 2^10 is far beyond maxCooldown anyway,
+	// and lets the multiplication overflow on a runaway attempt counter.
+	if failedProbes > 10 {
+		return maxCooldown
+	}
+	d := probeBackoffBase * time.Duration(1<<uint(failedProbes))
 	if d > maxCooldown {
 		d = maxCooldown
 	}
@@ -270,8 +285,9 @@ func (r *BanRepository) RecordSuccess(ctx context.Context, scope BanScope) error
 		// Re-read the doc so we can compute the recovery duration if we're
 		// transitioning out of a ban. UpdateOne would lose that context.
 		var existing struct {
-			State    string     `bson:"state"`
-			BannedAt *time.Time `bson:"banned_at"`
+			State        string     `bson:"state"`
+			BannedAt     *time.Time `bson:"banned_at"`
+			ProbeAttempt int        `bson:"probe_attempt"`
 		}
 		err := col.FindOne(ctx, scope.mongoFilter()).Decode(&existing)
 		if err != nil && err != mongo.ErrNoDocuments {
@@ -312,11 +328,33 @@ func (r *BanRepository) RecordSuccess(ctx context.Context, scope BanScope) error
 			delete(update, "$inc")
 		}
 
-		_, err = col.UpdateOne(ctx, scope.mongoFilter(), update, options.Update().SetUpsert(true))
+		if _, err = col.UpdateOne(ctx, scope.mongoFilter(), update, options.Update().SetUpsert(true)); err != nil {
+			return err
+		}
+
+		// The ban actually lifted — bank the observation so the per-site
+		// estimate can learn from it. Best-effort: the request already
+		// succeeded, a stats write must not fail it.
+		if existing.State == StateBanned && existing.BannedAt != nil {
+			r.recordRecoveryEvent(ctx, scope, *existing.BannedAt, now, existing.ProbeAttempt)
+		}
+		return nil
+	}
+
+	// Postgres path. Read the pre-update state first so we can tell a genuine
+	// ban→active recovery from an ordinary success on an already-active scope.
+	var (
+		prevState    string
+		prevBannedAt *time.Time
+		prevAttempt  int
+	)
+	if err := r.db.Pool.QueryRow(ctx, `
+		SELECT state, banned_at, probe_attempt FROM proxy_domain_bans
+		WHERE proxy_id = $1 AND machine_id = $2 AND target_domain = $3
+	`, scope.ProxyID, scope.MachineID, scope.TargetDomain).Scan(&prevState, &prevBannedAt, &prevAttempt); err != nil && err != pgx.ErrNoRows {
 		return err
 	}
 
-	// Postgres path
 	_, err := r.db.Pool.Exec(ctx, `
 		INSERT INTO proxy_domain_bans (
 			proxy_id, machine_id, target_domain, target_country,
@@ -336,7 +374,13 @@ func (r *BanRepository) RecordSuccess(ctx context.Context, scope BanScope) error
 				ELSE proxy_domain_bans.successful_since_recovery + 1
 			END
 	`, scope.ProxyID, scope.MachineID, scope.TargetDomain, nullableStr(scope.TargetCountry), now)
-	return err
+	if err != nil {
+		return err
+	}
+	if prevState == StateBanned && prevBannedAt != nil {
+		r.recordRecoveryEvent(ctx, scope, *prevBannedAt, now, prevAttempt)
+	}
+	return nil
 }
 
 // RecordFailure increments the per-scope failure streak. When it crosses
@@ -503,7 +547,7 @@ func (r *BanRepository) ClaimTrialProxy(ctx context.Context, machineID, domain s
 		return 0, false, nil
 	}
 	now := time.Now()
-	hold := probeBackoffStep // enough time for the trial's result to land
+	hold := trialHoldWindow // enough time for the trial result to land
 
 	if r.db.IsMongo() {
 		col := r.db.MongoDB().Collection("proxy_domain_bans")
@@ -896,6 +940,31 @@ func (r *BanRepository) ListCooldowns(ctx context.Context) ([]CooldownRow, error
 		out = append(out, r0)
 	}
 	return out, nil
+}
+
+// ClearAllCooldowns removes every currently-banned scope from
+// proxy_domain_bans, putting those (proxy, machine, site) combinations back
+// into rotation immediately. Returns how many scopes were cleared.
+//
+// Rows are deleted rather than flipped to active so the failure streak goes
+// with them — a cleared scope needs a fresh run of failureThreshold failures
+// before it can be banned again. Rows in the active state are left alone: they
+// are not cooldowns and the dashboard tab doesn't show them.
+func (r *BanRepository) ClearAllCooldowns(ctx context.Context) (int64, error) {
+	if r.db.IsMongo() {
+		res, err := r.db.MongoDB().Collection("proxy_domain_bans").
+			DeleteMany(ctx, bson.M{"state": StateBanned})
+		if err != nil {
+			return 0, err
+		}
+		return res.DeletedCount, nil
+	}
+
+	tag, err := r.db.Pool.Exec(ctx, `DELETE FROM proxy_domain_bans WHERE state = 'banned'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // BanRow is what the /api/v1/bans endpoint surfaces. It reuses the cooldown

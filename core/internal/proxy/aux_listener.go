@@ -17,10 +17,13 @@ import (
 
 // AuxListenerSpec describes one (machine, country)→port aux listener. When
 // MachineID is empty the listener falls back to defaultMachineID at start.
+// Mode is "" (sticky) or "rotate" — rotate mode signals the main proxy to
+// pick a fresh random proxy per request, avoiding consecutive repeats.
 type AuxListenerSpec struct {
 	MachineID string
 	Country   string
 	Port      int
+	Mode      string
 }
 
 // StartAuxListeners spawns a credential-injection listener for each spec.
@@ -56,18 +59,25 @@ func StartAuxListeners(defaultMachineID string, listenAddr string, mainPort int,
 		if !models.IsValidMachineID(machineID) {
 			return fmt.Errorf("aux listener on port %d: unknown machine_id %q", s.Port, machineID)
 		}
-		if err := startOneAuxListener(machineID, s.Country, listenAddr, s.Port, mainPort, log); err != nil {
+		if err := startOneAuxListener(machineID, s.Country, s.Mode, listenAddr, s.Port, mainPort, log); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func startOneAuxListener(machineID, country, listenAddr string, listenPort, mainPort int, log *logger.Logger) error {
+func startOneAuxListener(machineID, country, mode, listenAddr string, listenPort, mainPort int, log *logger.Logger) error {
 	if country == "" {
 		return fmt.Errorf("aux listener on port %d has empty country", listenPort)
 	}
-	creds := base64.StdEncoding.EncodeToString([]byte(machineID + ":" + country))
+	// Encode routing hints into Basic auth. The 3rd colon field is
+	// optional and carries the mode when non-sticky. Two fields =
+	// sticky (backward compatible).
+	credsPayload := machineID + ":" + country
+	if mode == "rotate" {
+		credsPayload += ":rotate"
+	}
+	creds := base64.StdEncoding.EncodeToString([]byte(credsPayload))
 	authHeaderValue := "Basic " + creds
 
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", listenAddr, listenPort))
@@ -80,6 +90,12 @@ func startOneAuxListener(machineID, country, listenAddr string, listenPort, main
 		"port", listenPort,
 		"machine_id", machineID,
 		"country", country,
+		"mode", func() string {
+			if mode == "" {
+				return "sticky"
+			}
+			return mode
+		}(),
 	)
 
 	go func() {

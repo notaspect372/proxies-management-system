@@ -392,6 +392,30 @@ var migrations = []Migration{
 			DROP TABLE IF EXISTS recovery_trials;
 		`,
 	},
+	{
+		Version:     18,
+		Description: "Add recovery_events for per-site cooldown estimates",
+		Up: `
+			CREATE TABLE IF NOT EXISTS recovery_events (
+				id BIGSERIAL PRIMARY KEY,
+				proxy_id INTEGER NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+				machine_id VARCHAR(120) NOT NULL,
+				target_domain VARCHAR(255) NOT NULL,
+				target_country VARCHAR(80) NULL,
+				banned_at TIMESTAMPTZ NOT NULL,
+				recovered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+				recovery_sec BIGINT NOT NULL,
+				trials INTEGER NOT NULL DEFAULT 0
+			);
+			CREATE INDEX IF NOT EXISTS idx_recovery_events_domain
+				ON recovery_events(target_domain, recovered_at DESC);
+			CREATE INDEX IF NOT EXISTS idx_recovery_events_recovered
+				ON recovery_events(recovered_at DESC);
+		`,
+		Down: `
+			DROP TABLE IF EXISTS recovery_events;
+		`,
+	},
 }
 
 // Migrate runs all pending migrations

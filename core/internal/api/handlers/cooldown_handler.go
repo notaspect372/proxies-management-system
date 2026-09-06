@@ -42,3 +42,28 @@ func (h *CooldownHandler) List(w http.ResponseWriter, r *http.Request) {
 		"total":     len(rows),
 	})
 }
+
+// ClearAll handles DELETE /api/v1/cooldowns.
+//
+//	@Summary		Clear every cooldown
+//	@Description	Deletes all banned (proxy, machine, site) scopes, returning
+//	@Description	those proxies to rotation immediately. Failure streaks are
+//	@Description	dropped with them, so a cleared scope has to fail from
+//	@Description	scratch before it can be banned again.
+//	@Tags			cooldowns
+//	@Produce		json
+//	@Success		200	{object}	map[string]interface{}	"Number of scopes cleared"
+//	@Failure		500	{object}	models.ErrorResponse
+//	@Router			/cooldowns [delete]
+func (h *CooldownHandler) ClearAll(w http.ResponseWriter, r *http.Request) {
+	cleared, err := h.bans.ClearAllCooldowns(r.Context())
+	if err != nil {
+		h.logger.Error("clear cooldowns failed", "error", err)
+		http.Error(w, "failed to clear cooldowns", http.StatusInternalServerError)
+		return
+	}
+
+	h.logger.Info("cleared all cooldowns", "cleared", cleared)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"cleared": cleared})
+}

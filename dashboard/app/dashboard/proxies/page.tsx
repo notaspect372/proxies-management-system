@@ -191,11 +191,26 @@ export default function ProxiesPage() {
     void fetchProxies()
   }, [fetchProxies])
 
+  const [addingProxy, setAddingProxy] = React.useState(false)
+  const [addProxyError, setAddProxyError] = React.useState<string | null>(null)
+
   const handleAddProxy = async () => {
+    // Temporary diagnostic: proves the click reaches the handler and shows
+    // the raw form state. Remove once "add button not working" is nailed
+    // down.
+    console.log("[addProxy] click received", newProxy)
+    const address = newProxy.address.trim()
+    if (!address) {
+      setAddProxyError("Address is required (e.g. 192.168.1.100:8001).")
+      toast.warning("Address is required", "Fill in the Address field first.")
+      return
+    }
+    setAddingProxy(true)
+    setAddProxyError(null)
     try {
       const costNum = parseFloat(newProxy.cost)
       await api.addProxy({
-        address: newProxy.address,
+        address,
         protocol: newProxy.protocol,
         username: newProxy.username || undefined,
         password: newProxy.password || undefined,
@@ -208,8 +223,14 @@ export default function ProxiesPage() {
       toast.success("Proxy added successfully")
       fetchProxies()
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error"
       console.error("Failed to add proxy:", error)
-      toast.error("Failed to add proxy", error instanceof Error ? error.message : "Unknown error")
+      // Keep the dialog open and show the error inline so a missed toast
+      // can't hide the reason (e.g. duplicate address, 500 from server).
+      setAddProxyError(message)
+      toast.error("Failed to add proxy", message)
+    } finally {
+      setAddingProxy(false)
     }
   }
 
@@ -1119,7 +1140,13 @@ export default function ProxiesPage() {
       </Card>
 
       {/* Add Proxy Dialog */}
-      <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
+      <Dialog
+        open={isAddDialogOpen}
+        onOpenChange={(open) => {
+          setIsAddDialogOpen(open)
+          if (!open) setAddProxyError(null)
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Add New Proxy</DialogTitle>
@@ -1222,12 +1249,28 @@ export default function ProxiesPage() {
               />
             </div>
           </div>
+          {addProxyError && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {addProxyError}
+            </div>
+          )}
           <DialogFooter>
-            <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
+            <Button
+              variant="outline"
+              onClick={() => setIsAddDialogOpen(false)}
+              disabled={addingProxy}
+            >
               Cancel
             </Button>
-            <Button onClick={handleAddProxy}>
-              Add Proxy
+            <Button onClick={handleAddProxy} disabled={addingProxy}>
+              {addingProxy ? (
+                <>
+                  <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                  Adding
+                </>
+              ) : (
+                "Add Proxy"
+              )}
             </Button>
           </DialogFooter>
         </DialogContent>

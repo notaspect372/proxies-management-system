@@ -330,10 +330,15 @@ export interface ProxyTestResult {
 // entries (AUX_LISTENERS) come back as `manual` so the UI can show them
 // read-only and keep the user from picking a conflicting port.
 
+export type ListenerMode = "sticky" | "rotate"
+
 export interface ListenerEntry {
   machine_id: string
   country: string
   port: number
+  // Backend serializes "" for the default (sticky); the UI normalizes at
+  // read time. New entries always send an explicit "sticky" or "rotate".
+  mode?: ListenerMode | ""
 }
 
 export interface ListenerState {
@@ -341,4 +346,49 @@ export interface ListenerState {
   manual: ListenerEntry[]
   env_path: string
   fleet_machines: string[]
+}
+
+// Learned per-site cooldown profile. Built from recovery_events — one row per
+// observed ban to active transition — so a site only appears once it has been
+// seen recovering at least once. Durations are seconds.
+export interface DomainRecoveryEstimate {
+  target_domain: string
+  target_country?: string
+  samples: number
+  estimated_sec: number
+  median_sec: number
+  min_sec: number
+  max_sec: number
+  avg_trials: number
+  distinct_proxies: number
+  distinct_machines: number
+  currently_banned: number
+  last_recovered_at?: string
+}
+
+export interface RecoveryEstimatesResponse {
+  estimates: DomainRecoveryEstimate[]
+  total: number
+}
+
+// One observation behind an estimate: this proxy on this machine was banned at
+// banned_at and confirmed working again at recovered_at, after `trials` failed
+// recovery trials.
+export interface RecoveryEvent {
+  proxy_id: number
+  proxy_address?: string
+  machine_id: string
+  target_domain: string
+  target_country?: string
+  banned_at: string
+  recovered_at: string
+  recovery_sec: number
+  trials: number
+}
+
+export interface RecoveryEstimateDetail {
+  target_domain: string
+  events: RecoveryEvent[]
+  trials: RecoveryTrialRow[] | null
+  waiting: CooldownRow[] | null
 }

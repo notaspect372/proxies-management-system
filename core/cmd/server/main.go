@@ -81,6 +81,9 @@ func run() error {
 	if err := banRepo.EnsureMongoIndexes(ctx); err != nil {
 		log.Warn("failed to ensure proxy_domain_bans indexes", "error", err)
 	}
+	if err := banRepo.EnsureRecoveryEventIndexes(ctx); err != nil {
+		log.Warn("failed to ensure recovery_events indexes", "error", err)
+	}
 
 	// Recovery is now IN-BAND: when a banned scope's cooldown elapses, the next
 	// real scraper request for that (machine, domain) is routed through the
@@ -120,6 +123,7 @@ func run() error {
 				MachineID: l.MachineID,
 				Country:   l.Country,
 				Port:      l.Port,
+				Mode:      l.Mode,
 			})
 		}
 		if err := proxy.StartAuxListeners(cfg.RoutingDefaultMachine, cfg.AuxListenAddr, cfg.ProxyPort, specs, log); err != nil {

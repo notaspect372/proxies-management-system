@@ -40,7 +40,7 @@ func OptionsMiddleware() func(next http.Handler) http.Handler {
 			if r.Method == "OPTIONS" {
 				// Set basic CORS headers for preflight
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
 				w.Header().Set("Access-Control-Max-Age", "300")
 				w.WriteHeader(http.StatusOK)

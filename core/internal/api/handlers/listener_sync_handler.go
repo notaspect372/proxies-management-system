@@ -68,6 +68,49 @@ func (h *ListenerSyncHandler) Add(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, state)
 }
 
+// Update handles PATCH /api/v1/admin/listeners/{port}.
+//
+//	@Summary		Partially update the listener on {port}
+//	@Description	Body accepts any subset of {machine_id, country, port,
+//	@Description	mode}. Only provided fields change. If port changes the
+//	@Description	new port must not collide with another listener. Works on
+//	@Description	managed and manual entries.
+//	@Tags			admin
+//	@Accept			json
+//	@Produce		json
+//	@Param			port	path		int	true	"Port"
+//	@Success		200		{object}	services.State
+//	@Failure		400		{object}	map[string]string
+//	@Failure		404		{object}	map[string]string
+//	@Failure		409		{object}	map[string]string
+//	@Router			/admin/listeners/{port} [patch]
+func (h *ListenerSyncHandler) Update(w http.ResponseWriter, r *http.Request) {
+	portStr := chi.URLParam(r, "port")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "port must be an integer between 1 and 65535"})
+		return
+	}
+	var patch services.ListenerPatch
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	state, err := h.sync.Update(port, patch)
+	if err != nil {
+		writeListenerError(w, h.logger, "listener update failed", err)
+		return
+	}
+	h.logger.Info("listener updated",
+		"port", port,
+		"machine_id_changed", patch.MachineID != nil,
+		"country_changed", patch.Country != nil,
+		"port_changed", patch.Port != nil,
+		"mode_changed", patch.Mode != nil,
+	)
+	writeJSON(w, http.StatusOK, state)
+}
+
 // Delete handles DELETE /api/v1/admin/listeners/{port}.
 //
 //	@Summary	Remove the managed listener bound to {port}
@@ -100,6 +143,8 @@ func writeListenerError(w http.ResponseWriter, log *logger.Logger, msg string, e
 	case errors.Is(err, services.ErrInvalidInput),
 		errors.Is(err, services.ErrUnknownMachine):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, services.ErrNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 	case errors.Is(err, services.ErrPortInUse):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 	case errors.Is(err, services.ErrNoEnvFile):

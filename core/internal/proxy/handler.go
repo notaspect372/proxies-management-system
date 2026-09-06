@@ -136,7 +136,14 @@ func (h *UpstreamProxyHandler) sendViaRoutedProxy(req *http.Request, ctx context
 	}
 	domain := hostOnly(host)
 
-	picked, sticky, isTrial, err := h.assignments.Checkout(ctx, hints.MachineID, domain, hints.Country, true)
+	var picked *models.Proxy
+	var sticky, isTrial bool
+	var err error
+	if hints.Rotate {
+		picked, sticky, isTrial, err = h.assignments.CheckoutRotate(ctx, hints.MachineID, domain, hints.Country, true)
+	} else {
+		picked, sticky, isTrial, err = h.assignments.Checkout(ctx, hints.MachineID, domain, hints.Country, true)
+	}
 	if err != nil {
 		return nil, 0, false, fmt.Errorf("checkout failed: %w", err)
 	}

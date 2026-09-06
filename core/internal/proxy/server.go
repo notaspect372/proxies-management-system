@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alpkeskin/rota/core/internal/models"
 	"github.com/alpkeskin/rota/core/internal/repository"
 	"github.com/alpkeskin/rota/core/pkg/logger"
 	"github.com/elazarl/goproxy"
@@ -128,7 +129,14 @@ func New(
 			if req != nil && req.Context() != nil {
 				ctx = req.Context()
 			}
-			picked, sticky, isTrial, err := assignmentRepo.Checkout(ctx, hints.MachineID, hostOnly(addr), hints.Country, true)
+			var picked *models.Proxy
+			var sticky, isTrial bool
+			var err error
+			if hints.Rotate {
+				picked, sticky, isTrial, err = assignmentRepo.CheckoutRotate(ctx, hints.MachineID, hostOnly(addr), hints.Country, true)
+			} else {
+				picked, sticky, isTrial, err = assignmentRepo.Checkout(ctx, hints.MachineID, hostOnly(addr), hints.Country, true)
+			}
 			if err != nil {
 				log.Warn("routed CONNECT failed at checkout",
 					"source", "proxy",

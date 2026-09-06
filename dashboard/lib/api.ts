@@ -19,6 +19,8 @@ import {
   RecoveryTrialsResponse,
   ListenerEntry,
   ListenerState,
+  RecoveryEstimatesResponse,
+  RecoveryEstimateDetail,
 } from "./types"
 
 function stripTrailingSlash(url: string): string {
@@ -39,9 +41,12 @@ class ApiClient {
   }
 
   /**
-   * Dev (`next dev`): browser calls the Go API directly on :8001 (avoids Next proxy noise; needs CORS on the API).
-   * Production build: same-origin `/api/v1/...` → Next rewrites to the core (Docker / `next start`).
-   * Override anytime with NEXT_PUBLIC_API_URL.
+   * Browser (dev and production): same-origin `/api/v1/...` → Next rewrites to
+   * the core. Staying same-origin is what lets the dashboard work when it's
+   * opened from another device (LAN / Tailscale) — an absolute 127.0.0.1 would
+   * be baked into the client bundle and resolve to *that device's* localhost.
+   * Server-side rendering can't use relative URLs, so it keeps the loopback origin.
+   * Override with NEXT_PUBLIC_API_URL only to reach a core on a different host.
    */
   private getBaseUrl(): string {
     if (this.baseUrlOverride !== null) {
@@ -52,9 +57,7 @@ class ApiClient {
       return stripTrailingSlash(env)
     }
     if (typeof window !== "undefined") {
-      return process.env.NODE_ENV === "development"
-        ? "http://127.0.0.1:8001"
-        : ""
+      return ""
     }
     return "http://127.0.0.1:8001"
   }
@@ -355,6 +358,27 @@ class ApiClient {
     return this.request<CooldownResponse>("/api/v1/cooldowns")
   }
 
+  /** Learned cooldown estimate per site, best-evidenced sites first. */
+  async getRecoveryEstimates(): Promise<RecoveryEstimatesResponse> {
+    return this.request<RecoveryEstimatesResponse>("/api/v1/recovery-estimates")
+  }
+
+  /** The observations, trials and currently-waiting scopes behind one site. */
+  async getRecoveryEstimateDetail(
+    domain: string
+  ): Promise<RecoveryEstimateDetail> {
+    return this.request<RecoveryEstimateDetail>(
+      `/api/v1/recovery-estimates/${encodeURIComponent(domain)}`
+    )
+  }
+
+  /** Deletes every banned scope, returning the affected proxies to rotation. */
+  async clearCooldowns(): Promise<{ cleared: number }> {
+    return this.request<{ cleared: number }>("/api/v1/cooldowns", {
+      method: "DELETE",
+    })
+  }
+
   async getBans(classification?: BanClassification): Promise<BansResponse> {
     const query = classification ? `?classification=${classification}` : ""
     return this.request<BansResponse>(`/api/v1/bans${query}`)
@@ -395,6 +419,31 @@ class ApiClient {
     return this.request<ListenerState>(`/api/v1/admin/listeners/${port}`, {
       method: "DELETE",
     })
+  }
+
+  // Partial update. Any missing field means "keep current value". Mode may
+  // arrive as ""|undefined from the raw entry type; server treats "" as
+  // sticky, which is also our normalization at read time.
+  async updateListener(
+    port: number,
+    patch: {
+      machine_id?: string
+      country?: string
+      port?: number
+      mode?: "sticky" | "rotate" | ""
+    }
+  ): Promise<ListenerState> {
+    return this.request<ListenerState>(`/api/v1/admin/listeners/${port}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    })
+  }
+
+  async setListenerMode(
+    port: number,
+    mode: "sticky" | "rotate"
+  ): Promise<ListenerState> {
+    return this.updateListener(port, { mode })
   }
 
   async getSettings(): Promise<Settings> {

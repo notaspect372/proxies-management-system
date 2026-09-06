@@ -24,12 +24,29 @@ type ListenerEntry struct {
 	MachineID string `json:"machine_id"`
 	Country   string `json:"country"`
 	Port      int    `json:"port"`
+	// Mode is "sticky" (default — same proxy per (machine, domain)) or
+	// "rotate" (fresh random proxy per request, no consecutive repeats).
+	// Empty deserializes to "sticky" downstream.
+	Mode string `json:"mode"`
+}
+
+// EffectiveMode is Mode with "" normalized to "sticky" so the UI never has
+// to render an empty string.
+func (e ListenerEntry) EffectiveMode() string {
+	if e.Mode == "rotate" {
+		return "rotate"
+	}
+	return "sticky"
 }
 
 // String renders the entry in the AUX_LISTENERS env format
-// (`machine_id/country:port`).
+// (`machine_id/country:port` or `machine_id/country:port:rotate`).
 func (e ListenerEntry) String() string {
-	return fmt.Sprintf("%s/%s:%d", e.MachineID, e.Country, e.Port)
+	base := fmt.Sprintf("%s/%s:%d", e.MachineID, e.Country, e.Port)
+	if e.Mode == "rotate" {
+		return base + ":rotate"
+	}
+	return base
 }
 
 // ListenerSync owns the read/write pipeline for the sheet-managed listener
@@ -64,6 +81,10 @@ var ErrInvalidInput = errors.New("invalid listener input")
 // have nowhere to persist. Surfaced as 500 by the handler.
 var ErrNoEnvFile = errors.New("no .env file to write")
 
+// ErrNotFound means the caller asked to mutate an entry whose port isn't
+// present in either managed or manual lists. Surfaced as 404 by the handler.
+var ErrNotFound = errors.New("listener not found")
+
 // State is the bundle returned by List + after every mutation: the full
 // managed entry list, plus the .env path so the UI can render "writing
 // to /path/to/.env" in error messages.
@@ -91,6 +112,7 @@ func (s *ListenerSync) Add(in ListenerEntry) (State, error) {
 
 	in.MachineID = strings.TrimSpace(in.MachineID)
 	in.Country = strings.TrimSpace(in.Country)
+	in.Mode = strings.ToLower(strings.TrimSpace(in.Mode))
 	if in.MachineID == "" {
 		return s.snapshot(), fmt.Errorf("%w: machine_id is required", ErrInvalidInput)
 	}
@@ -100,6 +122,13 @@ func (s *ListenerSync) Add(in ListenerEntry) (State, error) {
 	if in.Port < 1 || in.Port > 65535 {
 		return s.snapshot(), fmt.Errorf("%w: port must be between 1 and 65535", ErrInvalidInput)
 	}
+	if in.Mode != "" && in.Mode != "sticky" && in.Mode != "rotate" {
+		return s.snapshot(), fmt.Errorf("%w: mode must be sticky or rotate", ErrInvalidInput)
+	}
+	if in.Mode == "sticky" {
+		// Store the default as empty so old parsers stay happy and diff-friendly.
+		in.Mode = ""
+	}
 	if !models.IsValidMachineID(in.MachineID) {
 		return s.snapshot(), fmt.Errorf("%w: %q (must be one of %s)", ErrUnknownMachine, in.MachineID, strings.Join(models.FleetMachineIDs(), ", "))
 	}
@@ -108,38 +137,161 @@ func (s *ListenerSync) Add(in ListenerEntry) (State, error) {
 	}
 
 	entries := append(cloneEntries(s.cfg.AuxListenersSheet), in)
-	if err := s.persist(entries); err != nil {
+	if err := s.persistManaged(entries); err != nil {
 		return s.snapshot(), err
 	}
 	return s.snapshot(), nil
 }
 
-// Delete removes the entry on the given port from AUX_LISTENERS_SHEET. If
-// the port isn't in the managed set the call is a no-op (so the UI's
-// delete-after-stale-refresh case doesn't 404). Manual entries are NEVER
-// removed by this method — only the AUX_LISTENERS_SHEET section is touched.
+// ListenerPatch is the wire shape for partial listener updates. Every field
+// is a pointer so we can distinguish "not provided" from "cleared to zero".
+type ListenerPatch struct {
+	MachineID *string `json:"machine_id,omitempty"`
+	Country   *string `json:"country,omitempty"`
+	Port      *int    `json:"port,omitempty"`
+	Mode      *string `json:"mode,omitempty"`
+}
+
+// Update applies `patch` to the listener currently registered on `port`.
+// Only non-nil fields are changed; everything else keeps its current value.
+// Works on entries in either the managed or manual list — the entry stays
+// in whichever list it was in.
+//
+// If Port is changed, the new port is checked for collisions against every
+// other entry (both lists). Returns ErrNotFound if the source port isn't
+// registered, ErrInvalidInput on shape errors, ErrUnknownMachine if a new
+// machine_id isn't in the Fleet, and ErrPortInUse if a new port collides.
+func (s *ListenerSync) Update(port int, patch ListenerPatch) (State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find the entry by port — it's either in managed or manual.
+	managedIdx := findPortIndex(s.cfg.AuxListenersSheet, port)
+	manualIdx := findPortIndex(s.cfg.AuxListeners, port)
+	if managedIdx < 0 && manualIdx < 0 {
+		return s.snapshot(), fmt.Errorf("%w: no listener on port %d", ErrNotFound, port)
+	}
+
+	// Build the target entry by applying the patch on top of the existing.
+	var current config.AuxListenerConfig
+	inManaged := managedIdx >= 0
+	if inManaged {
+		current = s.cfg.AuxListenersSheet[managedIdx]
+	} else {
+		current = s.cfg.AuxListeners[manualIdx]
+	}
+
+	updated := current
+	if patch.MachineID != nil {
+		updated.MachineID = strings.TrimSpace(*patch.MachineID)
+	}
+	if patch.Country != nil {
+		updated.Country = strings.TrimSpace(*patch.Country)
+	}
+	if patch.Port != nil {
+		updated.Port = *patch.Port
+	}
+	if patch.Mode != nil {
+		mode := strings.ToLower(strings.TrimSpace(*patch.Mode))
+		switch mode {
+		case "", "sticky":
+			updated.Mode = ""
+		case "rotate":
+			updated.Mode = "rotate"
+		default:
+			return s.snapshot(), fmt.Errorf("%w: mode must be sticky or rotate", ErrInvalidInput)
+		}
+	}
+
+	// Validate the result.
+	if updated.MachineID == "" {
+		return s.snapshot(), fmt.Errorf("%w: machine_id is required", ErrInvalidInput)
+	}
+	if updated.Country == "" {
+		return s.snapshot(), fmt.Errorf("%w: country is required", ErrInvalidInput)
+	}
+	if updated.Port < 1 || updated.Port > 65535 {
+		return s.snapshot(), fmt.Errorf("%w: port must be between 1 and 65535", ErrInvalidInput)
+	}
+	if !models.IsValidMachineID(updated.MachineID) {
+		return s.snapshot(), fmt.Errorf("%w: %q (must be one of %s)", ErrUnknownMachine, updated.MachineID, strings.Join(models.FleetMachineIDs(), ", "))
+	}
+
+	// Port collision: any OTHER entry (in either list) already using the
+	// target port. The entry we're editing is always allowed to keep its
+	// own port.
+	if updated.Port != current.Port {
+		if owner := s.portOwner(updated.Port); owner != "" {
+			return s.snapshot(), fmt.Errorf("%w: port %d is already used by %s", ErrPortInUse, updated.Port, owner)
+		}
+	}
+
+	// Write back into the correct list.
+	if inManaged {
+		out := make([]config.AuxListenerConfig, len(s.cfg.AuxListenersSheet))
+		copy(out, s.cfg.AuxListenersSheet)
+		out[managedIdx] = updated
+		if err := s.persistManaged(configToEntries(out)); err != nil {
+			return s.snapshot(), err
+		}
+	} else {
+		out := make([]config.AuxListenerConfig, len(s.cfg.AuxListeners))
+		copy(out, s.cfg.AuxListeners)
+		out[manualIdx] = updated
+		if err := s.persistManual(configToEntries(out)); err != nil {
+			return s.snapshot(), err
+		}
+	}
+	return s.snapshot(), nil
+}
+
+// findPortIndex returns the index of the entry on `port` in `in`, or -1.
+func findPortIndex(in []config.AuxListenerConfig, port int) int {
+	for i, e := range in {
+		if e.Port == port {
+			return i
+		}
+	}
+	return -1
+}
+
+// Delete removes the entry on the given port from whichever list it lives
+// in (managed AUX_LISTENERS_SHEET first, then manual AUX_LISTENERS). If it
+// isn't in either list the call is a no-op so the UI's delete-after-stale-
+// refresh case doesn't 404. Only the line that actually contained the port
+// gets rewritten — the other list is untouched.
 func (s *ListenerSync) Delete(port int) (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	curr := s.cfg.AuxListenersSheet
-	out := make([]config.AuxListenerConfig, 0, len(curr))
+	if next, removed := withoutPort(s.cfg.AuxListenersSheet, port); removed {
+		if err := s.persistManaged(configToEntries(next)); err != nil {
+			return s.snapshot(), err
+		}
+		return s.snapshot(), nil
+	}
+	if next, removed := withoutPort(s.cfg.AuxListeners, port); removed {
+		if err := s.persistManual(configToEntries(next)); err != nil {
+			return s.snapshot(), err
+		}
+		return s.snapshot(), nil
+	}
+	return s.snapshot(), nil
+}
+
+// withoutPort returns a copy of in with any entry on the given port removed,
+// plus a bool reporting whether anything was actually removed.
+func withoutPort(in []config.AuxListenerConfig, port int) ([]config.AuxListenerConfig, bool) {
+	out := make([]config.AuxListenerConfig, 0, len(in))
 	removed := false
-	for _, e := range curr {
+	for _, e := range in {
 		if e.Port == port {
 			removed = true
 			continue
 		}
 		out = append(out, e)
 	}
-	if !removed {
-		return s.snapshot(), nil
-	}
-	entries := configToEntries(out)
-	if err := s.persist(entries); err != nil {
-		return s.snapshot(), err
-	}
-	return s.snapshot(), nil
+	return out, removed
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,9 +334,9 @@ func labelMachine(id string) string {
 	return id
 }
 
-// persist sorts the entries, rewrites the .env, and updates the live config.
-// Callers must hold s.mu.
-func (s *ListenerSync) persist(entries []ListenerEntry) error {
+// persistManaged sorts entries, rewrites AUX_LISTENERS_SHEET in the .env,
+// and updates the live config.AuxListenersSheet. Callers must hold s.mu.
+func (s *ListenerSync) persistManaged(entries []ListenerEntry) error {
 	if s.cfg.EnvFilePath == "" {
 		return ErrNoEnvFile
 	}
@@ -196,6 +348,21 @@ func (s *ListenerSync) persist(entries []ListenerEntry) error {
 	return nil
 }
 
+// persistManual sorts entries, rewrites AUX_LISTENERS in the .env, and
+// updates the live config.AuxListeners. Used when the UI deletes an entry
+// that was originally hand-maintained. Callers must hold s.mu.
+func (s *ListenerSync) persistManual(entries []ListenerEntry) error {
+	if s.cfg.EnvFilePath == "" {
+		return ErrNoEnvFile
+	}
+	sortEntries(entries)
+	if err := writeManualEnv(s.cfg.EnvFilePath, entries); err != nil {
+		return fmt.Errorf("write .env: %w", err)
+	}
+	s.cfg.AuxListeners = entriesToConfig(entries)
+	return nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Conversions + sort
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +370,7 @@ func (s *ListenerSync) persist(entries []ListenerEntry) error {
 func cloneEntries(in []config.AuxListenerConfig) []ListenerEntry {
 	out := make([]ListenerEntry, 0, len(in))
 	for _, e := range in {
-		out = append(out, ListenerEntry{MachineID: e.MachineID, Country: e.Country, Port: e.Port})
+		out = append(out, ListenerEntry{MachineID: e.MachineID, Country: e.Country, Port: e.Port, Mode: e.Mode})
 	}
 	sortEntries(out)
 	return out
@@ -212,7 +379,7 @@ func cloneEntries(in []config.AuxListenerConfig) []ListenerEntry {
 func configToEntries(in []config.AuxListenerConfig) []ListenerEntry {
 	out := make([]ListenerEntry, 0, len(in))
 	for _, e := range in {
-		out = append(out, ListenerEntry{MachineID: e.MachineID, Country: e.Country, Port: e.Port})
+		out = append(out, ListenerEntry{MachineID: e.MachineID, Country: e.Country, Port: e.Port, Mode: e.Mode})
 	}
 	return out
 }
@@ -220,7 +387,7 @@ func configToEntries(in []config.AuxListenerConfig) []ListenerEntry {
 func entriesToConfig(in []ListenerEntry) []config.AuxListenerConfig {
 	out := make([]config.AuxListenerConfig, 0, len(in))
 	for _, e := range in {
-		out = append(out, config.AuxListenerConfig{MachineID: e.MachineID, Country: e.Country, Port: e.Port})
+		out = append(out, config.AuxListenerConfig{MachineID: e.MachineID, Country: e.Country, Port: e.Port, Mode: e.Mode})
 	}
 	return out
 }
@@ -251,27 +418,40 @@ func renderEnvValue(entries []ListenerEntry) string {
 	return strings.Join(parts, ",")
 }
 
-// writeManagedEnv rewrites only the AUX_LISTENERS_SHEET line of the .env
-// file at envPath, preserving every other line (including comments and the
-// manual AUX_LISTENERS entry). If the key isn't present, it's appended at
-// the end under a marker comment so the next write can find and update it.
-//
-// We write to a temp sibling and rename, so a crash mid-write can't leave a
-// half-empty .env that fails to load on the next start.
+// writeManagedEnv rewrites the AUX_LISTENERS_SHEET line of the .env file.
 func writeManagedEnv(envPath string, entries []ListenerEntry) error {
+	return writeEnvKey(envPath, "AUX_LISTENERS_SHEET", renderEnvValue(entries),
+		"# === managed by /dashboard/listener-sync — add/remove there, not here ===")
+}
+
+// writeManualEnv rewrites the AUX_LISTENERS line of the .env file. Used
+// when the UI deletes an entry that lives in the manually-maintained list.
+func writeManualEnv(envPath string, entries []ListenerEntry) error {
+	return writeEnvKey(envPath, "AUX_LISTENERS", renderEnvValue(entries), "")
+}
+
+// writeEnvKey rewrites the line for `<key>=` in the .env file at envPath,
+// preserving every other line (including comments and other env values). If
+// the key isn't present, it's appended at the end — optionally under
+// appendComment, which lets the managed-block line explain to whoever opens
+// the file that a UI is rewriting it.
+//
+// Writes to a temp sibling + rename so a crash mid-write can't leave a
+// half-empty .env that fails to load on the next start.
+func writeEnvKey(envPath, key, value, appendComment string) error {
 	original, err := os.ReadFile(envPath)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", envPath, err)
 	}
 
-	value := renderEnvValue(entries)
+	prefix := key + "="
 	lines := splitKeepEndings(string(original))
 	replaced := false
 	for i, line := range lines {
 		trimmed := strings.TrimLeft(line, " \t")
-		if strings.HasPrefix(trimmed, "AUX_LISTENERS_SHEET=") {
+		if strings.HasPrefix(trimmed, prefix) {
 			ending := lineEnding(line)
-			lines[i] = "AUX_LISTENERS_SHEET=" + value + ending
+			lines[i] = prefix + value + ending
 			replaced = true
 			break
 		}
@@ -284,11 +464,11 @@ func writeManagedEnv(envPath string, entries []ListenerEntry) error {
 				lines[len(lines)-1] = last + "\n"
 			}
 		}
-		lines = append(lines,
-			"\n",
-			"# === managed by /dashboard/listeners — edit there, not here ===\n",
-			"AUX_LISTENERS_SHEET="+value+"\n",
-		)
+		lines = append(lines, "\n")
+		if appendComment != "" {
+			lines = append(lines, appendComment+"\n")
+		}
+		lines = append(lines, prefix+value+"\n")
 	}
 
 	tmp := envPath + ".tmp"

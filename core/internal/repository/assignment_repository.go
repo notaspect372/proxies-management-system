@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/alpkeskin/rota/core/internal/database"
@@ -25,10 +26,20 @@ var ErrNoEligibleProxy = errors.New("no eligible proxy")
 type AssignmentRepository struct {
 	db      *database.DB
 	banRepo *BanRepository
+
+	// lastPickedByScope remembers the last proxy id chosen per (machine,
+	// country) scope in rotate mode, so the next pick can skip it and avoid
+	// two identical IPs back-to-back. In-memory only — resets on restart,
+	// which is fine since the guarantee is "consecutive" not "over time".
+	rotateMu          sync.Mutex
+	lastPickedByScope map[string]int
 }
 
 func NewAssignmentRepository(db *database.DB) *AssignmentRepository {
-	return &AssignmentRepository{db: db}
+	return &AssignmentRepository{
+		db:                db,
+		lastPickedByScope: make(map[string]int),
+	}
 }
 
 // SetBanRepo enables per-(proxy, machine, country) ban filtering in Checkout.
@@ -56,8 +67,33 @@ func (r *AssignmentRepository) Checkout(
 	machineID, domain, targetCountry string,
 	allowTrial bool,
 ) (proxy *models.Proxy, sticky bool, isTrial bool, err error) {
+	return r.checkoutInternal(ctx, machineID, domain, targetCountry, allowTrial, false)
+}
+
+// CheckoutRotate is the rotate-mode variant of Checkout. Every call picks a
+// random proxy from the eligible pool while guaranteeing it isn't the same
+// as the immediately preceding pick for (machine, targetCountry). Sticky
+// lookup is skipped and no assignment row is persisted, so subsequent calls
+// keep rotating instead of settling. Ban filters and recovery trials still
+// apply — the only difference from sticky is "no reuse of the last IP".
+func (r *AssignmentRepository) CheckoutRotate(
+	ctx context.Context,
+	machineID, domain, targetCountry string,
+	allowTrial bool,
+) (proxy *models.Proxy, sticky bool, isTrial bool, err error) {
+	return r.checkoutInternal(ctx, machineID, domain, targetCountry, allowTrial, true)
+}
+
+func (r *AssignmentRepository) checkoutInternal(
+	ctx context.Context,
+	machineID, domain, targetCountry string,
+	allowTrial bool,
+	rotate bool,
+) (proxy *models.Proxy, sticky bool, isTrial bool, err error) {
 	// 0. In-band recovery: if a banned proxy for this scope is due for a
 	// trial, route THIS real request through it instead of a healthy proxy.
+	// Trials fire in both modes — recovery of a banned scope matters
+	// regardless of whether the scraper wants sticky or rotate.
 	if allowTrial && r.banRepo != nil {
 		if pid, ok, terr := r.banRepo.ClaimTrialProxy(ctx, machineID, domain); terr == nil && ok {
 			if tp, ferr := r.fetchProxyIfHealthy(ctx, pid, ""); ferr == nil && tp != nil {
@@ -66,6 +102,13 @@ func (r *AssignmentRepository) Checkout(
 			// Claimed proxy is gone/globally unhealthy — skip the trial and
 			// fall through to normal selection (the hold already moved it out).
 		}
+	}
+
+	// Rotate mode short-circuits: no sticky lookup, no assignment upsert.
+	// Just pick from the country-preferred pool (minus bans, minus the
+	// last-picked proxy for this scope) and hand it back.
+	if rotate {
+		return r.pickRotate(ctx, machineID, domain, targetCountry)
 	}
 
 	// 1. Look up existing assignment.
@@ -131,6 +174,68 @@ func (r *AssignmentRepository) Checkout(
 	if err := r.upsertAssignment(ctx, machineID, domain, picked.ID, targetCountry); err != nil {
 		return nil, false, false, fmt.Errorf("upsert assignment: %w", err)
 	}
+
+	return picked, false, false, nil
+}
+
+// pickRotate implements the rotate-mode branch of Checkout: fetch the
+// country-preferred pool (fall back to the global healthy pool), strip
+// banned proxies for this (machine, domain), remove the last-picked proxy
+// for this (machine, country) scope so we don't return two in a row, and
+// pick one at random. Returns (nil, false, false, ErrNoEligibleProxy) if
+// the pool ends up empty.
+func (r *AssignmentRepository) pickRotate(
+	ctx context.Context,
+	machineID, domain, targetCountry string,
+) (*models.Proxy, bool, bool, error) {
+	pool, err := r.eligiblePool(ctx, targetCountry)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if len(pool) == 0 && targetCountry != "" {
+		pool, err = r.eligiblePool(ctx, "")
+		if err != nil {
+			return nil, false, false, err
+		}
+	}
+	pool, err = r.filterBanned(ctx, pool, machineID, domain)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if len(pool) == 0 {
+		return nil, false, false, ErrNoEligibleProxy
+	}
+
+	// Try to skip the last-picked proxy for this scope. If it's the only
+	// eligible proxy left, we have no choice — hand it back and accept a
+	// consecutive repeat rather than fail the request.
+	scopeKey := machineID + "|" + targetCountry
+	r.rotateMu.Lock()
+	lastID, hadLast := r.lastPickedByScope[scopeKey]
+	r.rotateMu.Unlock()
+
+	candidates := pool
+	if hadLast && len(pool) > 1 {
+		filtered := make([]*models.Proxy, 0, len(pool)-1)
+		for _, p := range pool {
+			if p.ID != lastID {
+				filtered = append(filtered, p)
+			}
+		}
+		if len(filtered) > 0 {
+			candidates = filtered
+		}
+	}
+
+	idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(candidates))))
+	if err != nil {
+		return nil, false, false, fmt.Errorf("rand: %w", err)
+	}
+	picked := candidates[idx.Int64()]
+
+	r.rotateMu.Lock()
+	r.lastPickedByScope[scopeKey] = picked.ID
+	r.rotateMu.Unlock()
 
 	return picked, false, false, nil
 }

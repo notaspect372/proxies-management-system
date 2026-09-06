@@ -11,11 +11,13 @@ import (
 // RoutingHints carries the machine_id + country a scraper has encoded into the
 // proxy URL credentials, e.g. http://main_machine_vm1:Taiwan@host:8006.
 //
-// When present we route via the sticky AssignmentRepository.Checkout instead
-// of the random/round-robin selector.
+// When present we route via AssignmentRepository.Checkout — sticky by default,
+// or fresh-random per request when Rotate is true (the aux listener encodes
+// this via a 3rd colon field: `machine:country:rotate`).
 type RoutingHints struct {
 	MachineID string
 	Country   string // optional; "" means no country filter
+	Rotate    bool   // true → per-request random pick, no consecutive repeats
 }
 
 // Per-machine defaults. When set via env, requests without a
@@ -60,7 +62,11 @@ func parseRoutingHints(req *http.Request) (*RoutingHints, bool) {
 	if err != nil {
 		return nil, false
 	}
-	parts := strings.SplitN(string(decoded), ":", 2)
+	// Accept `machine:country[:mode]`. The 3rd field is optional; the aux
+	// listener sets it to "rotate" when the listener was configured with
+	// rotate mode. Older aux listeners (or manual scraper credentials)
+	// only send 2 fields — sticky, backward compatible.
+	parts := strings.SplitN(string(decoded), ":", 3)
 	if len(parts) == 0 || parts[0] == "" {
 		return nil, false
 	}
@@ -69,10 +75,14 @@ func parseRoutingHints(req *http.Request) (*RoutingHints, bool) {
 		return nil, false
 	}
 	country := ""
-	if len(parts) == 2 {
+	if len(parts) >= 2 {
 		country = parts[1]
 	}
-	return &RoutingHints{MachineID: machineID, Country: country}, true
+	rotate := false
+	if len(parts) == 3 && strings.EqualFold(strings.TrimSpace(parts[2]), "rotate") {
+		rotate = true
+	}
+	return &RoutingHints{MachineID: machineID, Country: country, Rotate: rotate}, true
 }
 
 // stripProxyAuth removes the routing header so it isn't forwarded upstream.

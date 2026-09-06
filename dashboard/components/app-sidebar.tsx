@@ -15,6 +15,7 @@ import {
   Timer,
   Ban,
   Sheet as SheetIcon,
+  Brain,
 } from "lucide-react"
 import { useTheme } from "next-themes"
 
@@ -62,6 +63,11 @@ const navigation = [
     title: "Ban Analysis",
     url: "/dashboard/bans",
     icon: Ban,
+  },
+  {
+    title: "Recovery Estimates",
+    url: "/dashboard/recovery-estimates",
+    icon: Brain,
   },
   {
     title: "Aux Listeners",
